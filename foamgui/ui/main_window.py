@@ -10,9 +10,10 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from ..foam import dictfile, ofenv
 from ..foam.case import FoamCase
 from .bc_tab import BoundaryConditionsTab, InitialConditionsTab
-from .mesh_tab import MeshTab
 from .output_tab import OutputTab
+from .patch_panel import PatchPanel
 from .solver_tab import SolverTab
+from .view_panel import ViewPanel
 
 __all__ = ["MainWindow"]
 
@@ -26,33 +27,106 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1500, 950)
         self.case: FoamCase | None = None
         self._dirty = False
+        self._syncing_patch = False
 
-        self.mesh_tab = MeshTab(self)
+        # 左边常驻三维窗口, 右上补片树(模型树), 右下设置页签
+        self.view_panel = ViewPanel(self)
+        self.patch_panel = PatchPanel(self)
         self.ic_tab = InitialConditionsTab(self)
         self.bc_tab = BoundaryConditionsTab(self)
         self.solver_tab = SolverTab(self)
         self.output_tab = OutputTab(self)
 
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self.mesh_tab, "1. 网格")
-        self.tabs.addTab(self.ic_tab, "2. 初始条件")
-        self.tabs.addTab(self.bc_tab, "3. 边界条件")
-        self.tabs.addTab(self.solver_tab, "4. 求解设置")
-        self.tabs.addTab(self.output_tab, "5. 生成字典")
-        self.setCentralWidget(self.tabs)
+        self.tabs.addTab(self.bc_tab, "边界条件")
+        self.tabs.addTab(self.ic_tab, "初始条件")
+        self.tabs.addTab(self.solver_tab, "求解设置")
+        self.tabs.addTab(self.output_tab, "生成字典")
+
+        right = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        right.addWidget(self.patch_panel)
+        right.addWidget(self.tabs)
+        right.setStretchFactor(0, 0)
+        right.setStretchFactor(1, 1)
+        right.setSizes([300, 620])
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.addWidget(self.view_panel)
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setSizes([960, 460])
+        self.setCentralWidget(split)
 
         self._build_actions()
+        self._build_dock()   # 菜单里的"视图"要用到 dock, 所以先建 dock
         self._build_menus()
-        self._build_dock()
         self._build_statusbar()
 
         for tab in (self.ic_tab, self.bc_tab, self.solver_tab):
             tab.changed.connect(self._on_changed)
-        for tab in (self.mesh_tab, self.ic_tab, self.bc_tab, self.solver_tab, self.output_tab):
+        for tab in (self.ic_tab, self.bc_tab, self.solver_tab, self.output_tab):
             tab.statusMessage.connect(self.show_message)
+        self.view_panel.statusMessage.connect(self.show_message)
+        self.patch_panel.statusMessage.connect(self.show_message)
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+        # 三维窗口 <-> 模型树 双向联动
+        self.view_panel.patchClicked.connect(self._on_patch_picked)
+        self.patch_panel.patchSelected.connect(self._on_patch_selected)
+        self.patch_panel.patchVisibilityChanged.connect(self.view_panel.set_patch_visible)
+        self.patch_panel.patchColorChanged.connect(self.view_panel.set_patch_color)
+        self.patch_panel.patchRenameRequested.connect(self._rename_patch)
+        self.patch_panel.volumeColorToggled.connect(self.view_panel.set_volume_color)
+        self.bc_tab.patchActivated.connect(self._on_patch_selected)
+
         self._restore_geometry()
+
+    # ------------------------------------------------------------------
+    # 三维窗口 <-> 模型树 联动
+    # ------------------------------------------------------------------
+    def _on_patch_picked(self, name: str) -> None:
+        """在三维窗口里点到了某个补片。"""
+        self.patch_panel.select(name)
+
+    def _on_patch_selected(self, name: str) -> None:
+        """补片被选中(来自三维窗口或模型树): 两边都高亮, 并跳到它的边界条件。"""
+        if self._syncing_patch:
+            return
+        self._syncing_patch = True
+        try:
+            self.patch_panel.select(name, emit=False)
+            self.patch_panel.set_patch_checked(name, True)
+            self.view_panel.set_patch_visible(name, True)
+            self.view_panel.set_selected_patch(name)
+            self.bc_tab.select_patch(name)
+            self.show_message(f"已选中补片: {name}")
+        finally:
+            self._syncing_patch = False
+
+    def _rename_patch(self, old: str, new: str) -> None:
+        if self.case is None:
+            return
+        try:
+            touched = self.case.rename_patch(old, new)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "重命名失败", str(exc))
+            self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+            return
+        self.view_panel.view.scene.rename_patch_name(old, new)
+        self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+        self.patch_panel.select(new, emit=False)
+        self.view_panel.set_selected_patch(new)
+        self.ic_tab.set_case(self.case)
+        self.bc_tab.set_case(self.case)
+        self.bc_tab.select_patch(new)
+        self.output_tab.refresh(force=True)
+        self._refresh_case_tree()
+        self._on_changed()
+        self.show_message(
+            f"补片 {old} 已重命名为 {new}; 同步更新了 {len(touched)} 个场, "
+            "写出时会一并更新 constant/polyMesh/boundary"
+        )
 
     # ------------------------------------------------------------------
     # 界面
@@ -91,6 +165,21 @@ class MainWindow(QtWidgets.QMainWindow):
         m.addAction(self.act_write)
         m.addSeparator()
         m.addAction(self.act_quit)
+        mv = self.menuBar().addMenu("视图")
+        mv.addAction(self.dock.toggleViewAction())
+        act_fit = QtGui.QAction("重置视角(等轴测)", self)
+        act_fit.setShortcut("Ctrl+0")
+        act_fit.triggered.connect(lambda: self.view_panel.view.reset_view("iso"))
+        mv.addAction(act_fit)
+        act_front = QtGui.QAction("正视(+Z)", self)
+        act_front.setShortcut("Ctrl+1")
+        act_front.triggered.connect(lambda: self.view_panel.view.reset_view("+z"))
+        mv.addAction(act_front)
+        act_proj = QtGui.QAction("切换 正交/透视", self)
+        act_proj.setShortcut("Ctrl+P")
+        act_proj.triggered.connect(self._toggle_projection)
+        mv.addAction(act_proj)
+
         mh = self.menuBar().addMenu("帮助")
         mh.addAction(self.act_help)
         mh.addAction(self.act_about)
@@ -114,8 +203,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.case_tree.setColumnWidth(0, 150)
         self.case_tree.setAlternatingRowColors(True)
         dock.setWidget(self.case_tree)
-        dock.setMinimumWidth(320)
+        dock.setMinimumWidth(300)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        dock.hide()  # 默认收起, 把空间留给三维窗口(视图菜单里可打开)
         self.dock = dock
 
     def _build_statusbar(self) -> None:
@@ -176,7 +266,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bc_tab.set_case(case)
         self.solver_tab.set_case(case)
         self.output_tab.set_case(case)
-        self.mesh_tab.set_case(case, load_mesh=mesh_error is None)
+        self.view_panel.set_case(case, load_mesh=mesh_error is None)
+        self.patch_panel.set_mesh(case.mesh, self.view_panel.view.scene.patch_colors)
         if mesh_error:
             QtWidgets.QMessageBox.warning(self, "网格读取失败", mesh_error)
         self._refresh_case_tree()
@@ -304,6 +395,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings().setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
 
+    def _toggle_projection(self) -> None:
+        combo = self.view_panel.cmb_projection
+        combo.setCurrentIndex(1 if combo.currentIndex() == 0 else 0)
+        self.show_message(f"投影方式: {combo.currentText()}")
+
     # ------------------------------------------------------------------
     def _show_help(self) -> None:
         QtWidgets.QMessageBox.information(
@@ -313,13 +409,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "<ol>"
             "<li><b>打开案例</b>: 选择包含 <code>constant/polyMesh</code> 的案例目录 "
             "(例如 airFoil2D)。</li>"
-            "<li><b>1. 网格</b>: 读取并三维显示 polyMesh, 可按补片显示/上色、显示内部网格线、"
-            "剖切看内部、导出图片。</li>"
-            "<li><b>2. 初始条件</b>: 设置每个场 <code>0/&lt;场&gt;</code> 的 internalField。</li>"
-            "<li><b>3. 边界条件</b>: 选择场, 逐补片选择边界条件类型并填参数; "
+            "<li><b>三维窗口(常驻左侧)</b>: 显示 polyMesh; 上方控制栏可切换视角"
+            "(±X/±Y/±Z/等轴测)、<b>正交/透视投影</b>、内部网格线、外框、补片边线, "
+            "以及沿 x/y/z 剖切看内部(剖面按单元体积着色); 也可以导出图片。</li>"
+            "<li><b>单击三维窗口里的补片表面</b>即可选中它: 右上角的模型树会自动选中对应行, "
+            "下方边界条件页也会跳到该补片; 反过来在模型树里选一行, 三维窗口里对应补片会高亮。</li>"
+            "<li><b>补片改名</b>: 在模型树里双击“补片”列(或点“重命名…”)。改名会同步到"
+            "<code>constant/polyMesh/boundary</code> 与所有场的 boundaryField, 写出时一并更新。</li>"
+            "<li><b>边界条件</b>: 选择场, 逐补片选择边界条件类型并填参数; "
             "可以按补片名一键推荐(会根据 inlet/outlet/wall/empty 自动判断)。</li>"
-            "<li><b>4. 求解设置</b>: controlDict / 湍流模型 / 物性 / 离散格式 / 线性求解器。</li>"
-            "<li><b>5. 生成字典</b>: 预览每个文件的内容, 确认后写入案例目录(自动备份到 "
+            "<li><b>初始条件</b>: 设置每个场 <code>0/&lt;场&gt;</code> 的 internalField。</li>"
+            "<li><b>求解设置</b>: controlDict / 湍流模型 / 物性 / 离散格式 / 线性求解器。</li>"
+            "<li><b>生成字典</b>: 预览每个文件的内容, 确认后写入案例目录(自动备份到 "
             "<code>foamgui_backup/</code>), 也可以另存到新目录, 或用 foamDictionary 校验。</li>"
             "</ol>"
             "<p>提示: 读取再写出的过程中, GUI 没有覆盖到的字典条目都会被原样保留。</p>",

@@ -97,6 +97,14 @@ class MeshScene:
 
         self.axes_actor = vtkAxesActor()
         self.axes_widget = None
+        self._actor_to_patch: dict[object, str] = {}
+        self.selected_patch: str | None = None
+        self.parallel_projection = True
+        self._pick_tris: np.ndarray | None = None
+        self._pick_names: list[str] = []
+        self._pick_sig: tuple | None = None
+        self._snap_xyz: np.ndarray | None = None
+        self._snap_names: list[str] = []
         self._lut = _make_lut()
         self._bounds: tuple[float, float, float, float, float, float] = (0, 1, 0, 1, 0, 1)
 
@@ -108,6 +116,8 @@ class MeshScene:
         self.patch_actors.clear()
         self.patch_colors.clear()
         self.patch_visible.clear()
+        self._actor_to_patch.clear()
+        self.selected_patch = None
         self.edges_actor = None
         self.outline_actor = None
         self.clip_actor = None
@@ -189,6 +199,7 @@ class MeshScene:
         cactor.SetMapper(cmap)
         cactor.GetProperty().SetInterpolationToFlat()
         cactor.SetVisibility(False)
+        cactor.SetPickable(False)
         self.clip_actor = cactor
         self._clip_filter = clip
         self._clip_mapper = cmap
@@ -204,6 +215,7 @@ class MeshScene:
         ceactor.GetProperty().SetLineWidth(0.4)
         ceactor.GetProperty().SetOpacity(0.35)
         ceactor.SetVisibility(False)
+        ceactor.SetPickable(False)
         self.clip_edges_actor = ceactor
         self._clip_edges = cedges
         self.renderer.AddActor(ceactor)
@@ -240,6 +252,7 @@ class MeshScene:
             self.patch_actors[patch.name] = actor
             self.patch_colors[patch.name] = color
             self.patch_visible[patch.name] = visible
+            self._actor_to_patch[actor] = patch.name
             self.renderer.AddActor(actor)
 
     def _build_wireframe(self, mesh: PolyMesh) -> None:
@@ -260,6 +273,7 @@ class MeshScene:
         prop.SetLineWidth(1.0)
         prop.SetOpacity(0.9)
         actor.SetVisibility(False)
+        actor.SetPickable(False)
         self.edges_actor = actor
         self.renderer.AddActor(actor)
 
@@ -278,6 +292,7 @@ class MeshScene:
         actor.SetMapper(mapper)
         actor.GetProperty().SetColor(0.80, 0.82, 0.88)
         actor.GetProperty().SetLineWidth(1.5)
+        actor.SetPickable(False)
         self.outline_actor = actor
         self.renderer.AddActor(actor)
 
@@ -286,6 +301,7 @@ class MeshScene:
         self.axes_actor.SetYAxisLabelText("Y")
         self.axes_actor.SetZAxisLabelText("Z")
         self.axes_actor.SetTotalLength(1.0, 1.0, 1.0)
+        self.axes_actor.SetPickable(False)
 
     # ------------------------------------------------------------------
     # 交互控制
@@ -411,6 +427,193 @@ class MeshScene:
             mapper.GetInput().GetCellData().SetScalars(None)
             self.set_patch_color(patch.name, default_patch_color(i, patch))
 
+    def rename_patch_name(self, old: str, new: str) -> None:
+        """补片改名后同步场景内部的索引(与 mesh 的 Patch.name 保持一致)。"""
+        if old in self.patch_actors:
+            self.patch_actors[new] = self.patch_actors.pop(old)
+            self.patch_colors[new] = self.patch_colors.pop(old, (0.5, 0.5, 0.5))
+            self.patch_visible[new] = self.patch_visible.pop(old, True)
+            actor = self.patch_actors[new]
+            self._actor_to_patch[actor] = new
+        if self.selected_patch == old:
+            self.selected_patch = new
+        self._pick_sig = None  # 强制重建拾取缓存
+
+    # -- 拾取与选中 ------------------------------------------------------
+    def _ensure_pick_cache(self) -> None:
+        """缓存拾取用的几何(只含当前可见的补片)。
+
+        不用 VTK 的 picker: 本机软件 OpenGL 下 vtkCellPicker 对补片 actor
+        取不到(实测), 自己做射线求交既稳定又快。
+        """
+        visible = tuple(name for name, vis in self.patch_visible.items() if vis) + (
+            bool(self.clip_enabled),
+        )
+        if self._pick_sig == visible and self._pick_tris is not None:
+            return
+        self._pick_sig = visible
+        self._pick_tris = None
+        self._pick_names = []
+        self._snap_xyz = None
+        self._snap_names = []
+        if self.clip_enabled or self.mesh is None:
+            return
+
+        mesh = self.mesh
+        centres = mesh.face_centres()
+        tris: list[np.ndarray] = []
+        names: list[str] = []
+        snap: list[np.ndarray] = []
+        snap_names: list[str] = []
+        fp = mesh.face_points
+        for patch in mesh.patches:
+            if not self.patch_visible.get(patch.name, True):
+                continue
+            lo, hi = patch.start_face, patch.start_face + patch.n_faces
+            sizes = mesh.face_sizes[lo:hi]
+            tri_per_face = np.maximum(sizes - 2, 0)
+            total = int(tri_per_face.sum())
+            if total:
+                face_idx = np.repeat(np.arange(patch.n_faces, dtype=np.int64), tri_per_face)
+                base = mesh.face_offsets[lo:hi][face_idx]
+                k = np.arange(total, dtype=np.int64) - np.repeat(
+                    np.concatenate(([0], np.cumsum(tri_per_face)))[:-1], tri_per_face
+                )
+                i0 = fp[base]
+                i1 = fp[base + k + 1]
+                i2 = fp[base + k + 2]
+                pts = mesh.points
+                tris.append(np.stack([pts[i0], pts[i1], pts[i2]], axis=1))
+                names.extend([patch.name] * total)
+            snap.append(centres[lo:hi])
+            snap_names.extend([patch.name] * patch.n_faces)
+        self._pick_tris = np.concatenate(tris) if tris else None
+        self._pick_names = names
+        self._snap_xyz = np.concatenate(snap) if snap else None
+        self._snap_names = snap_names
+
+    # -- 投影辅助 --------------------------------------------------------
+    def _project(self, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """世界坐标 -> 屏幕坐标(原点左下, 与 VTK 事件坐标一致)。"""
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        ren = self.renderer
+        cam = ren.GetActiveCamera()
+        w, h = ren.GetSize()
+        aspect = float(w) / max(float(h), 1.0)
+        near, far = cam.GetClippingRange()
+        mat = cam.GetCompositeProjectionTransformMatrix(aspect, near, far)
+        if mat is None:  # pragma: no cover
+            cam.GetProjectionTransformMatrix(aspect, near, far)
+            mat = cam.GetProjectionTransformMatrix(aspect, near, far)
+        m = np.array([[mat.GetElement(i, j) for j in range(4)] for i in range(4)])
+        homo = np.hstack([pts, np.ones((pts.shape[0], 1))]) @ m.T
+        wcomp = homo[:, 3]
+        wcomp = np.where(np.abs(wcomp) < 1e-12, 1e-12, wcomp)
+        ndc = homo[:, :3] / wcomp[:, None]
+        vp = ren.GetViewport()
+        x = (vp[0] + (ndc[:, 0] * 0.5 + 0.5) * (vp[2] - vp[0])) * w
+        y = (vp[1] + (ndc[:, 1] * 0.5 + 0.5) * (vp[3] - vp[1])) * h
+        return x, y, ndc[:, 2]
+
+    def pick_patch(self, x: int, y: int, snap_px: float = 12.0) -> str | None:
+        """在屏幕坐标 (x, y) 处拾取边界补片。
+
+        先做精确的射线-三角面求交; 没打中时(二维案例里 inlet/outlet/walls
+        都是垂直于视线的薄带, 正视图下打不中)退化为"吸附到最近的面心",
+        这样二维网格也能用鼠标点中。
+        """
+        if self.mesh is None:
+            return None
+        self._ensure_pick_cache()
+        ren = self.renderer
+        ren.SetDisplayPoint(float(x), float(y), 0.0)
+        ren.DisplayToWorld()
+        p0 = list(ren.GetWorldPoint())
+        ren.SetDisplayPoint(float(x), float(y), 1.0)
+        ren.DisplayToWorld()
+        p1 = list(ren.GetWorldPoint())
+        if p0[3]:
+            p0 = [c / p0[3] for c in p0]
+        if p1[3]:
+            p1 = [c / p1[3] for c in p1]
+        origin = np.array(p0[:3], dtype=np.float64)
+        direction = np.array(p1[:3], dtype=np.float64) - origin
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-15:
+            return None
+        direction /= norm
+
+        # 1) 精确求交
+        tris = self._pick_tris
+        if tris is not None and len(tris):
+            v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+            e1 = v1 - v0
+            e2 = v2 - v0
+            pvec = np.cross(direction, e2)
+            det = np.einsum("ij,ij->i", e1, pvec)
+            ok = np.abs(det) > 1e-14
+            inv = np.zeros_like(det)
+            inv[ok] = 1.0 / det[ok]
+            tvec = origin - v0
+            u = np.einsum("ij,ij->i", tvec, pvec) * inv
+            qvec = np.cross(tvec, e1)
+            v = np.einsum("j,ij->i", direction, qvec) * inv
+            t = np.einsum("ij,ij->i", e2, qvec) * inv
+            hit = ok & (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1.0 + 1e-9) & (t > 1e-9)
+            if hit.any():
+                idx = int(np.argmin(np.where(hit, t, np.inf)))
+                if idx < len(self._pick_names):
+                    return self._pick_names[idx]
+
+        # 2) 吸附: 找屏幕上离点击位置最近的面心
+        if self._snap_xyz is not None and len(self._snap_xyz) and snap_px > 0:
+            px, py, _pz = self._project(self._snap_xyz)
+            d2 = (px - float(x)) ** 2 + (py - float(y)) ** 2
+            best = int(np.argmin(d2))
+            if d2[best] <= snap_px * snap_px:
+                return self._snap_names[best]
+        return None
+
+    def _apply_patch_style(self, name: str, selected: bool) -> None:
+        actor = self.patch_actors.get(name)
+        if actor is None:
+            return
+        prop = actor.GetProperty()
+        if selected:
+            prop.SetLineWidth(4.0)
+            prop.SetEdgeColor(1.0, 0.72, 0.10)
+            prop.SetEdgeVisibility(True)
+            prop.SetAmbient(0.45)
+            prop.SetDiffuse(0.75)
+        else:
+            prop.SetLineWidth(1.0)
+            prop.SetEdgeColor(0.12, 0.12, 0.15)
+            prop.SetAmbient(0.0)
+            prop.SetDiffuse(1.0)
+
+    def set_selected_patch(self, name: str | None) -> None:
+        """高亮选中的补片(在三维窗口里用粗橙边显示)。"""
+        if self.selected_patch and self.selected_patch != name:
+            self._apply_patch_style(self.selected_patch, False)
+        self.selected_patch = name
+        if name:
+            if not self.patch_visible.get(name, True):
+                # 选中的补片如果原本隐藏, 自动显示出来
+                self.patch_visible[name] = True
+            actor = self.patch_actors.get(name)
+            if actor is not None and not self.clip_enabled:
+                actor.SetVisibility(True)
+            self._apply_patch_style(name, True)
+
+    # -- 投影方式 --------------------------------------------------------
+    def set_projection(self, parallel: bool) -> None:
+        """True = 正交(工程常用), False = 透视。"""
+        self.parallel_projection = bool(parallel)
+        cam = self.renderer.GetActiveCamera()
+        cam.SetParallelProjection(bool(parallel))
+        self.renderer.ResetCameraClippingRange()
+
     # -- 视角 -----------------------------------------------------------
     def reset_camera(self, direction: str = "+z") -> None:
         cam = self.renderer.GetActiveCamera()
@@ -439,7 +642,7 @@ class MeshScene:
             cam.SetViewUp(0, 1, 0)
         else:
             cam.SetViewUp(0, 0, 1)
-        cam.SetParallelProjection(True)
+        cam.SetParallelProjection(self.parallel_projection)
         self.renderer.ResetCamera()
         cam.Zoom(1.1)
         self.renderer.ResetCameraClippingRange()

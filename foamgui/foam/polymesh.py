@@ -88,6 +88,8 @@ class PolyMesh:
         self.patches = patches
         self.path: Path | None = None
         self.header_format = fmt
+        # boundary 文件的原始字典(重命名补片时要改它并写回)
+        self.boundary_body: "dictfile.FoamDict | None" = None
 
         self.n_points = int(self.points.shape[0])
         self.n_faces = len(faces)
@@ -507,11 +509,14 @@ def _read_mesh_files(mesh_dir: Path) -> tuple[np.ndarray, list[np.ndarray], np.n
 # ---------------------------------------------------------------------------
 # boundary 文件
 # ---------------------------------------------------------------------------
-def read_boundary(path: Path) -> list[Patch]:
+def read_boundary(path: Path, with_body: bool = False):
     """读取 ``polyMesh/boundary``。
 
     文件正体形如 ``4 ( inlet { ... } outlet { ... } )``, 解析后是一个列表,
     其中补片名是字符串、紧随其后的是该补片的字典。
+
+    ``with_body=True`` 时返回 ``(patches, body)``, ``body`` 是原始字典,
+    保留下来是为了补片重命名时能原样写回(不丢失未知条目)。
     """
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         text = fh.read()
@@ -553,6 +558,8 @@ def read_boundary(path: Path) -> list[Patch]:
                     in_groups=in_groups,
                 )
             )
+    if with_body:
+        return patches, body
     return patches
 
 
@@ -575,8 +582,9 @@ def read_polymesh(mesh_dir: str | Path) -> PolyMesh:
         if not (mesh_dir / name).exists():
             raise MeshError(f"缺少网格文件: {mesh_dir / name}")
     points, faces, owner, neighbour, fmt = _read_mesh_files(mesh_dir)
-    patches = read_boundary(mesh_dir / "boundary")
+    patches, boundary_body = read_boundary(mesh_dir / "boundary", with_body=True)
     mesh = PolyMesh(points, faces, owner, neighbour, patches, fmt=fmt)
+    mesh.boundary_body = boundary_body
     mesh.path = mesh_dir
     _validate(mesh)
     return mesh

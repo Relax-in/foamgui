@@ -198,12 +198,15 @@ class BoundaryConditionsTab(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
     statusMessage = QtCore.pyqtSignal(str)
+    #: 表格里选中了某个补片(用于和三维窗口联动)
+    patchActivated = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.case = None
         self.field = None
         self._loading = False
+        self._suppress_patch_signal = False
         self._param_widgets: list[tuple[str, QtWidgets.QWidget]] = []
 
         lay = QtWidgets.QVBoxLayout(self)
@@ -241,7 +244,7 @@ class BoundaryConditionsTab(QtWidgets.QWidget):
         self.table.setColumnWidth(0, 130)
         self.table.setColumnWidth(1, 200)
         self.table.setColumnWidth(2, 300)
-        self.table.itemSelectionChanged.connect(lambda: self._rebuild_params())
+        self.table.itemSelectionChanged.connect(self._on_row_selection_changed)
         lay.addWidget(self.table, 3)
 
         self.param_box = QtWidgets.QGroupBox("边界条件参数")
@@ -302,11 +305,33 @@ class BoundaryConditionsTab(QtWidgets.QWidget):
             )
             self.table.setCellWidget(r, 1, combo)
             self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(fields_mod.param_summary(d)))
-        self._loading = False
         if self.table.rowCount():
             self.table.selectRow(0)
-        else:
-            self._rebuild_params()
+        self._loading = False
+        self._rebuild_params()
+
+    def _on_row_selection_changed(self) -> None:
+        self._rebuild_params()
+        if self._loading or self._suppress_patch_signal:
+            return
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        item = self.table.item(row, 0)
+        if item is not None and item.text():
+            self.patchActivated.emit(item.text())
+
+    def select_patch(self, name: str) -> bool:
+        """选中指定补片那一行(不会反向触发 patchActivated, 避免联动死循环)。"""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.text() == name:
+                self._suppress_patch_signal = True
+                self.table.selectRow(row)
+                self.table.scrollToItem(item)
+                self._suppress_patch_signal = False
+                return True
+        return False
 
     # ------------------------------------------------------------------
     def _on_type_changed(self, patch: str, bctype: str) -> None:

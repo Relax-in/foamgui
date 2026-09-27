@@ -41,6 +41,7 @@ def main(argv: list[str]) -> int:
     print(f"    网格: {win.case.mesh.summary() if win.case.mesh else '未读取'}", flush=True)
 
     failures: list[str] = []
+    # 整窗截图(左边三维常驻 + 右上模型树 + 右下页签)
     for i in range(win.tabs.count()):
         win.tabs.setCurrentIndex(i)
         app.processEvents()
@@ -103,10 +104,48 @@ def main(argv: list[str]) -> int:
     assert "uniform 0.25" in case.render_all()["0/k"], "通过界面改初始条件失败"
     print("[3d] 初始条件界面交互正常", flush=True)
 
-    # 求解设置页: 改 endTime
-    win.tabs.setCurrentWidget(win.solver_tab)
+    # 模型树 -> 边界条件页 联动
+    win.patch_panel.select("walls")
     app.processEvents()
-    print("[3e] 求解设置页控件数:", win.solver_tab.control_form.rowCount(), flush=True)
+    assert win.bc_tab.table.currentRow() >= 0, "模型树选中补片后, 边界条件页没有定位"
+    bc_row_name = win.bc_tab.table.item(win.bc_tab.table.currentRow(), 0).text()
+    assert bc_row_name == "walls", f"边界条件页定位到了 {bc_row_name}"
+    print("[3e] 模型树 -> 边界条件联动正常(walls)", flush=True)
+
+    # 边界条件页 -> 模型树 反向联动
+    win.bc_tab.select_patch("inlet")
+    win.bc_tab.patchActivated.emit("inlet")
+    app.processEvents()
+    assert win.patch_panel.selected_patch() == "inlet", "边界条件页选中补片后模型树没跟上"
+    print("[3f] 边界条件 -> 模型树联动正常(inlet)", flush=True)
+
+    # 三维窗口拾取: 用 VTK 拾取接口模拟点击(inlet 面上的一个点)
+    scene = win.view_panel.view.scene
+    if scene.mesh is not None:
+        fc = scene.mesh.face_centres()
+        patch = scene.mesh.patch_by_name("outlet")
+        c = fc[patch.start_face]
+        win.view_panel.view.scene.renderer.SetDisplayPoint(c[0], c[1], c[2])
+        print("[3g] 三维拾取接口可用:", hasattr(scene, "pick_patch"), flush=True)
+
+    # 补片重命名
+    win._rename_patch("walls", "blade")
+    app.processEvents()
+    assert win.case.mesh.patch_by_name("blade") is not None, "重命名后网格里没有新名字"
+    assert "blade" in win.case.fields["U"].body.get("boundaryField").keys(), "场文件没同步改名"
+    assert "constant/polyMesh/boundary" in win.case.render_all(), "没有生成 boundary 文件"
+    assert win.patch_panel.selected_patch() == "blade", "重命名后模型树没有选中新名字"
+    print("[3h] 补片重命名 walls -> blade 正常(网格/场/boundary 都已同步)", flush=True)
+
+    # 再走一次"模型树里改名字"的完整信号链(等价于双击单元格改名)
+    item = win.patch_panel._items["outlet"]
+    item.setText(1, "farfield")
+    app.processEvents()
+    assert win.case.mesh.patch_by_name("farfield") is not None, "模型树改名没生效"
+    assert "farfield" in win.case.fields["p"].body.get("boundaryField").keys(), "改名没同步到场"
+    scene_colors = win.view_panel.view.scene.patch_colors
+    assert "farfield" in scene_colors and "outlet" not in scene_colors, "三维场景里的补片索引没同步改名"
+    print("[3i] 模型树双击改名 outlet -> farfield 正常(场景索引也同步)", flush=True)
 
     # 写出到临时目录
     written, _ = case.write(out_dir=out_dir, backup=False)

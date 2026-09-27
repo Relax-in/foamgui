@@ -70,6 +70,40 @@ def render_file(
     return header + body_text + "\n\n" + CLOSING
 
 
+def render_boundary_file(body: FoamDict) -> str:
+    """渲染 ``constant/polyMesh/boundary``。
+
+    结构与普通字典不同, 正体是 ``N ( 名字 { ... } 名字 { ... } )``,
+    所以单独写一个渲染函数(不要末尾的分号)。
+    """
+    header = BANNER + "FoamFile\n{\n"
+    header += "    format      ascii;\n"
+    header += "    class       polyBoundaryMesh;\n"
+    header += '    location    "constant/polyMesh";\n'
+    header += "    object      boundary;\n"
+    header += "}\n"
+    header += "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+
+    lines: list[str] = []
+    if body.items:
+        count, lst = body.items[0]
+        lines.append(str(count))
+        lines.append("(")
+        items = list(lst)
+        i = 0
+        while i + 1 < len(items):
+            name = items[i]
+            d = items[i + 1]
+            lines.append("    " + str(name))
+            if isinstance(d, FoamDict):
+                lines.append(dictfile.format_dict(d, 4))
+            else:
+                lines.append("    " + dictfile.format_value(d, 4))
+            i += 2
+        lines.append(")")
+    return header + "\n".join(lines) + "\n\n" + CLOSING
+
+
 @dataclass
 class FieldFile:
     """``0/`` 下的一个场文件。"""
@@ -135,6 +169,50 @@ class FoamCase:
         self.constant: dict[str, tuple[FoamDict, str]] = {}
         self.warnings: list[str] = []
         self._loaded = False
+        # 网格(boundary)是否被改过(例如补片重命名), 改过才需要写出 boundary 文件
+        self.mesh_modified = False
+
+    # -- 补片操作 -----------------------------------------------------------
+    def rename_patch(self, old: str, new: str) -> list[str]:
+        """重命名补片: 同步改网格 boundary 与所有场的 boundaryField。
+
+        返回被改动的场名列表。只改名字, 不动几何, 所以对求解没有影响。
+        """
+        new = (new or "").strip()
+        if not new:
+            raise ValueError("补片名不能为空")
+        if self.mesh is None:
+            raise ValueError("尚未读取网格")
+        patch = self.mesh.patch_by_name(old)
+        if patch is None:
+            raise ValueError(f"找不到补片 {old}")
+        if new == old:
+            return []
+        if self.mesh.patch_by_name(new) is not None:
+            raise ValueError(f"补片名 {new} 已存在")
+
+        patch.name = new
+        # 1) 网格 boundary 文件里的名字
+        body = self.mesh.boundary_body
+        if body is not None and body.items:
+            lst = body.items[0][1]
+            for i, item in enumerate(lst):
+                if isinstance(item, str) and item == old:
+                    lst[i] = new
+                    break
+        # 2) 每个场的 boundaryField 键(保持原有顺序与内容)
+        touched: list[str] = []
+        for name, ff in self.fields.items():
+            bf = ff.body.get("boundaryField")
+            if not isinstance(bf, FoamDict) or old not in bf:
+                continue
+            rebuilt = FoamDict()
+            for k, v in bf.items:
+                rebuilt.set(new if k == old else k, v)
+            ff.body.set("boundaryField", rebuilt)
+            touched.append(name)
+        self.mesh_modified = True
+        return touched
 
     # -- 基本信息 -----------------------------------------------------------
     @property
@@ -352,6 +430,8 @@ class FoamCase:
             out[f"system/{fname}"] = render_file(body, cls, fname, "system")
         for fname, (body, cls) in self.constant.items():
             out[f"constant/{fname}"] = render_file(body, cls, fname, "constant")
+        if self.mesh_modified and self.mesh is not None and self.mesh.boundary_body is not None:
+            out["constant/polyMesh/boundary"] = render_boundary_file(self.mesh.boundary_body)
         return out
 
     def write(

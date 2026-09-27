@@ -76,79 +76,96 @@ rm -rf vendor/
 
 ## 3. 界面说明
 
-界面按"前处理流程"分成 5 个页签，右侧常驻"案例信息"面板。
+界面按"前处理流程"组织，但**三维窗口始终可见**：左边是常驻的三维网格视图（上方一条控制栏），
+右上角是**补片模型树**，右下角是设置页签（边界条件 / 初始条件 / 求解设置 / 生成字典）。
+这样改初始条件或边界条件时，网格一直摆在眼前。
 
-### 3.1 网格
+![主界面](docs/gui_main_bc.jpg)
 
-![网格页](docs/gui_mesh_tab.png)
+### 3.1 三维窗口（常驻左侧）
 
-* 打开案例后自动读取 `constant/polyMesh`（`points/faces/owner/neighbour/boundary`）；
-* 三维窗口支持鼠标旋转/平移/缩放（VTK trackball），右下角有坐标轴指示器；
-* 左侧/中间是三维窗口，右侧控制面板：
-  * **边界补片**：每个补片的显隐勾选框、类型、面数、颜色（点色块改颜色）。`empty`/`wedge` 补片默认不显示（2D 案例显示它们会把整个网格挡住）；
-  * **显示**：内部网格线、外框、补片边线、按单元体积着色、补片透明度；
-  * **内部剖切**：选方向（x/y/z）与位置剖开看内部，剖面按"所属单元的体积"着色，便于快速判断网格疏密；
-  * **视角**：±X/±Y/±Z/等轴测，导出当前视图为 PNG；
-  * **网格信息**：点数/面数/内部面/单元数/包围盒/单元体积最大最小与比值。
+控制栏分两行：
 
-  下面是用本工具的离屏渲染能力输出的网格图（同一套 VTK 场景代码）：
+* **视角**：`+X -X +Y -Y +Z -Z` 与 **等轴测**，一键切到标准视图（快捷键 `Ctrl+0` 等轴测、`Ctrl+1` 正视）；
+* **投影**：**正交（工程）** 与 **透视** 可随时切换（快捷键 `Ctrl+P`）。正交适合看几何/对尺寸，
+  透视有近大远小，看三维形体更直观；
+* **显示**：内部网格线（2D 案例默认为开，看平面网格最清楚）、外框、补片边线；
+* **剖切**：勾选后沿 x/y/z 剖开看内部，剖面按"所属单元的体积"着色，可反向、可叠加剖面网格线；
+* **导出图片…**：把当前视图导出成 PNG。
 
-  | 网格线框 | 内部剖切（按单元体积着色） |
-  | --- | --- |
-  | ![网格线框](docs/mesh_wireframe.png) | ![内部剖切](docs/mesh_clip_volume.png) |
+鼠标：左键拖动旋转、中键/滚轮平移缩放（VTK 标准操作）。
 
-### 3.2 初始条件
+### 3.2 鼠标点选补片 <-> 模型树联动
 
-![初始条件页](docs/gui_ic_tab.png)
+* **在三维窗口里单击某个补片表面**，右上角模型树对应行会自动选中（并自动把它显示出来），
+  右下角的边界条件页也会跳到该补片；
+* 反过来，在模型树或边界条件表里选中某个补片，三维窗口里对应的补片会用**粗橙边**高亮；
+* 实现说明：拾取是自己做的射线-三角面求交（不是 VTK 的 picker，见 4.3 节）；
+  二维案例里 `inlet/outlet/walls` 都是垂直于视线的薄带，正视图下射线打不中，
+  所以还加了一层"按屏幕距离吸附最近面心"的兜底，保证二维网格也点得中。
 
-* 表格列出 `0/` 目录下所有场（`volScalarField` / `volVectorField`…），显示类型、`dimensions`、`internalField`；
-* 选中某个场后，在下面编辑它的内部值：
-  * `uniform`：直接填数（矢量填 3 个分量）；
-  * `$ 宏`：写成 `$internalField` 这类引用；
-  * `原样`：直接写 OpenFOAM 表达式；
-* 如果某个场原本是 `nonuniform`（逐单元给定），界面只做显示、不会覆盖它，除非你主动修改；
-* 可以"添加场"（从常见场目录里选，或直接输入名字，例如 `k`、`omega`）和"删除场"（只影响本次写出，磁盘原文件不动）。
+### 3.3 补片模型树与重命名
 
-### 3.3 边界条件
+* 每行一个补片：显示勾选框、补片名、类型、面数、颜色（点色块改色）；
+* **重命名**：双击"补片"列的名字直接改，或选中后点 **重命名…**；
+  改名会同时写到 `constant/polyMesh/boundary` 与**所有场**的 `boundaryField`，
+  写出字典时一并更新（已用 `checkMesh` + `foamRun` 验证过改名后算例仍能正常求解）；
+* **按体积着色**：用颜色表示单元体积大小，快速看网格疏密；
+* 补片行上还有 全选 / 全不选。
 
-![边界条件页](docs/gui_bc_tab.png)
+### 3.4 边界条件
 
-这是最常用的页面：
+![边界条件](docs/gui_main_bc.jpg)
 
 * 顶部选择**场**（`U` / `p` / `nut` / `nuTilda` …）；
 * 表格一行一个**补片**：补片名、边界条件类型（下拉框，按补片类型过滤）、参数摘要、补片类型；
-* 下面根据所选类型动态生成**参数表单**，常见参数（`value` / `freestreamValue` / `inletValue` / `p0` / `uniformValue` …）都能选 `uniform`、`$ 宏` 或原样写法；
+* 下面根据所选类型动态生成**参数表单**，常见参数（`value` / `freestreamValue` / `inletValue` /
+  `p0` / `uniformValue` …）都能选 `uniform`、`$ 宏` 或原样写法；
 * **按补片名推荐边界条件**：根据补片名与类型自动判断，例如
   * `empty`/`wedge` 补片 → `empty`/`wedge`
   * `walls`（wall 类型）→ `U: noSlip`、`p: zeroGradient`、`nut: nutUSpaldingWallFunction`…
-  * `inlet`/`outlet`/`farfield` → `U: freestreamVelocity $internalField`、`p: freestreamPressure $internalField`、湍流场 `freestream $internalField`
+  * `inlet`/`outlet`/`farfield` → `U: freestreamVelocity $internalField`、
+    `p: freestreamPressure $internalField`、湍流场 `freestream $internalField`
   * 名字里带 `symmetry` → `symmetry`
 * **同步网格补片**：换网格后新出现的补片，一键补进所有场。
 
-> 目录里没有列出的"冷门"边界条件参数不会被丢掉：它们会以"其他参数（原样保留）"的形式出现在表单里，可以继续编辑。
+> 目录里没有列出的"冷门"边界条件参数不会被丢掉：它们会以"其他参数（原样保留）"的形式出现在表单里。
 
-### 3.4 求解设置
+### 3.5 初始条件
 
-![求解设置页](docs/gui_solver_tab.png)
+![初始条件](docs/gui_main_ic.jpg)
+
+* 表格列出 `0/` 目录下所有场，显示类型、`dimensions`、`internalField`；
+* 选中某个场后编辑内部值：`uniform` 直接填数（矢量填 3 个分量）、`$ 宏` 写成 `$internalField`、
+  `原样` 直接写 OpenFOAM 表达式；
+* 原本是 `nonuniform`（逐单元给定）的场只做显示、不会被覆盖，除非你主动改；
+* 可以"添加场"（常见场目录或自己输名字，如 `k`、`omega`）和"删除场"（只影响本次写出）。
+
+### 3.6 求解设置
+
+![求解设置](docs/gui_main_solver.jpg)
 
 按文件分组，控件直接读写字典条目：
 
-* **controlDict**：`solver`（OpenFOAM 13 用 `foamRun` + 模块名，如 `incompressibleFluid`）、`startFrom/startTime/stopAt/endTime/deltaT`、写出控制、`writeFormat`、自适应时间步…
-* **momentumTransport**：`simulationType`（laminar/RAS/LES）、RAS/LES 模型（`SpalartAllmaras`、`kOmegaSST`…）、`turbulence` 开关；
+* **controlDict**：`solver`（OpenFOAM 13 用 `foamRun` + 模块名，如 `incompressibleFluid`）、
+  `startFrom/startTime/stopAt/endTime/deltaT`、写出控制、`writeFormat`、自适应时间步…
+* **momentumTransport**：`simulationType`（laminar/RAS/LES）、模型（`SpalartAllmaras`、`kOmegaSST`…）；
 * **physicalProperties**：`viscosityModel`、`rho`、`nu`（带量纲，只改数值）；
-* **fvSchemes**：`ddt/grad/laplacian/interpolation/snGrad` 的 default，以及 `divSchemes` 明细表格（可增删行，支持 `div(phi,U)` 这类带括号的键）；
-* **fvSolution**：`solvers` 表（每个场的 solver/smoother/nSweeps/tolerance/relTol）、`SIMPLE`/`PIMPLE` 参数、`relaxationFactors`。
+* **fvSchemes**：`ddt/grad/laplacian/interpolation/snGrad` 的 default，以及 `divSchemes` 明细表格
+  （可增删行，支持 `div(phi,U)` 这类带括号的键）；
+* **fvSolution**：`solvers` 表、`SIMPLE`/`PIMPLE` 参数、`relaxationFactors`。
 
-### 3.5 生成字典
+### 3.7 生成字典
 
-![生成字典页](docs/gui_output_tab.png)
+![生成字典](docs/gui_main_output.jpg)
 
-* 左侧列出将要写出的文件，带 `*` 的表示与磁盘上现有内容不同；
+* 左侧列出将要写出的文件，带 `*` 的表示与磁盘上现有内容不同；补片改过名时，
+  `constant/polyMesh/boundary` 也会出现在列表里；
 * 右侧是文件的**完整文本预览**（所见即所写）；
 * 三个按钮：
   * **写入案例目录**：写盘前把原文件备份到 `foamgui_backup/<时间戳>/`；
-  * **另存到新目录**：把整套字典写到一个新目录（不动原案例）；
-  * **用 foamDictionary 校验**：把生成结果写到临时目录，逐个用 OpenFOAM 自带工具解析一遍，确认语法没问题。
+  * **另存到新目录**：整套字典写到新目录（不动原案例）；
+  * **用 foamDictionary 校验**：写到临时目录并逐个用 OpenFOAM 工具解析一遍。
 
 ## 4. 设计思路（为什么这样写）
 
@@ -178,7 +195,21 @@ GUI 只修改它关心的条目，写盘时再整棵树序列化回文本。好�
 VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直接建成 `VTK_CONVEX_POINT_SET`
 在剖切时会崩、体积也不准（实测踩过这个坑）。补片则各自建一个 `vtkPolyData`，方便单独控制颜色与显隐。
 
-### 4.3 3D 场景与 Qt 解耦
+### 4.3 补片拾取：自己做射线求交
+
+三维窗口里的"点补片"没有用 VTK 的 `vtkCellPicker`：本机（软件 OpenGL / Mesa）
+实测它对补片 actor 取不到，而带 pick list 时更是必然返回空。于是改成
+`foamgui/ui/mesh_scene.py` 里自己做：
+
+1. 把可见补片的面三角化后缓存（numpy，几毫秒）；
+2. 由屏幕坐标反算世界坐标射线（`SetDisplayPoint` + `DisplayToWorld`）；
+3. 用 Möller–Trumbore 对全部三角面做向量化求交，取最近的命中；
+4. 没命中时退化为"投影到屏幕后吸附最近的面心"（12 px 内）——这一步专门为二维案例准备：
+   2D 网格里 `inlet/outlet/walls` 都是垂直于视线的薄带，正视图下射线打不中。
+
+这样既不依赖 OpenGL 后端的行为，也不受驱动/软件渲染影响。
+
+### 4.4 3D 场景与 Qt 解耦
 
 `MeshScene` 是纯 VTK 的，不依赖 Qt；Qt 那边只是用一个 `QVTKRenderWindowInteractor` 承载它。
 因此可以在无图形界面的环境下用离屏渲染出图（`foamgui/tests/render_preview.py`），
@@ -199,8 +230,9 @@ foamgui/
 │   └── ofenv.py              # 探测并调用 OpenFOAM 命令行工具
 ├── ui/
 │   ├── main_window.py        # 主窗口、菜单、案例树
-│   ├── mesh_tab.py           # 网格页（Qt 侧）
-│   ├── mesh_scene.py         # 三维场景（纯 VTK）
+│   ├── view_panel.py         # 三维视图面板（常驻）+ 控制条
+│   ├── mesh_scene.py         # 三维场景（纯 VTK：渲染/剖切/拾取）
+│   ├── patch_panel.py        # 补片模型树（显隐/颜色/重命名）
 │   ├── bc_tab.py             # 初始条件页 + 边界条件页
 │   ├── solver_tab.py         # 求解设置页
 │   ├── output_tab.py         # 生成/预览/写出字典页
@@ -276,7 +308,10 @@ git clone .backup/foamgui.git /tmp/foamgui-check
 ## 8. 已知限制 / 下一步
 
 * **只读网格、不生成网格**：目前不含 `blockMesh`/`snappyHexMesh` 的图形化建模，网格还是用 OpenFOAM 生成；
-* **场数据不显示**：三维窗口目前只显示网格几何与单元体积，还没有把 `U/p` 的计算结果映射上去（下一步可以加 `foamToVTK` 或直接读 `polyMesh` 的场文件做云图）；
+* **场数据不显示**：三维窗口目前只显示网格几何与单元体积，还没有把 `U/p` 的计算结果映射上去
+  （下一步可以加 `foamToVTK` 或直接读 `polyMesh` 的场文件做云图）；
+* **重命名是"改名字不改几何"**：网格拓扑没变，所以对求解没有影响；但如果案例里有
+  `snappyHexMesh` 的 `meshQualityDict` 等按名字写死的设置，需要自己检查；
 * **BC 目录是常见子集**：特殊求解器的专属边界条件没有全部收录，但可以用"其他参数（原样保留）"手工填；
 * **`0.orig`**：会优先读 `controlDict` 的 `startTime`，其次读 `0/`，最后才是 `0.orig`；
 * **GUI 启动的环境依赖**：见 2.1 节，Qt 6.5+ 需要 `libxcb-cursor0`，项目已带兜底副本；
