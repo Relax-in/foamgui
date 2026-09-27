@@ -20,3 +20,6 @@ foamgui_backup/
 
 # 本地裸仓库备份(版本历史)
 .backup/
+
+# GitHub 推送用的 SSH 私钥(不要提交)
+.ssh/
