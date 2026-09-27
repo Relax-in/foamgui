@@ -197,9 +197,16 @@ VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直�
 
 ### 4.3 补片拾取：自己做射线求交
 
-三维窗口里的"点补片"没有用 VTK 的 `vtkCellPicker`：本机（软件 OpenGL / Mesa）
-实测它对补片 actor 取不到，而带 pick list 时更是必然返回空。于是改成
-`foamgui/ui/mesh_scene.py` 里自己做：
+三维窗口里的"点补片"踩了两个 VTK 的坑，最后都绕开了：
+
+* `vtkCellPicker` 在本机（软件 OpenGL / Mesa）对补片 actor 取不到，带 pick list 时必然返回空；
+* 鼠标事件挂在 VTK 交互器上也收不到 —— QVTK 的 `mouseReleaseEvent` 里那句
+  `self._Iren.LeftButtonReleaseEvent()` 在本版本（VTK 9.7 + PyQt6）**不会真正派发事件**
+  （手动调用同一个方法却能派发），所以 `LeftButtonReleaseEvent` 观察者永远不触发。
+
+因此鼠标事件改为**在 Qt 层处理**（`MeshView.eventFilter`，按下/移动/抬起都走 Qt），
+坐标按 QVTK 同样的规则换算（`y → height-y-1`，并乘设备像素比），
+再交给 `foamgui/ui/mesh_scene.py` 里自己实现的拾取：
 
 1. 把可见补片的面三角化后缓存（numpy，几毫秒）；
 2. 由屏幕坐标反算世界坐标射线（`SetDisplayPoint` + `DisplayToWorld`）；
@@ -207,7 +214,8 @@ VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直�
 4. 没命中时退化为"投影到屏幕后吸附最近的面心"（12 px 内）——这一步专门为二维案例准备：
    2D 网格里 `inlet/outlet/walls` 都是垂直于视线的薄带，正视图下射线打不中。
 
-这样既不依赖 OpenGL 后端的行为，也不受驱动/软件渲染影响。
+这样既不依赖 OpenGL 后端的行为，也不受驱动/软件渲染影响；VTK 的交互样式照常收到事件，
+所以旋转/平移/缩放不受影响（拖动超过 4 px 就不算点击）。
 
 ### 4.4 3D 场景与 Qt 解耦
 
@@ -239,7 +247,8 @@ foamgui/
 │   └── widgets.py            # 通用小部件
 └── tests/
     ├── test_foam.py          # 单元测试（不需要 GUI）
-    ├── smoke_gui.py          # 离屏 GUI 冒烟测试（截图 + 试写）
+    ├── smoke_gui.py          # 离屏 GUI 冒烟测试（截图 + 联动 + 改名 + 试写）
+    ├── interaction_gui.py    # 真实窗口交互测试（鼠标点选/拖动/投影）
     ├── render_preview.py     # 离屏渲染网格预览图
     └── e2e_openfoam.py       # 端到端：写字典 + foamRun 真跑
 run_foamgui.sh                # 启动脚本(venv + Qt 依赖检查 + OpenFOAM 环境)
@@ -259,15 +268,19 @@ python -m foamgui.tests.test_foam airFoil2D
 # 2) 离屏 GUI 冒烟测试：打开 airFoil2D、切换每个页签、截图、试写字典
 QT_QPA_PLATFORM=offscreen FOAMGUI_SKIP_VTK_WIDGET=1 python -m foamgui.tests.smoke_gui airFoil2D _scratch/gui
 
-# 3) 离屏渲染网格图（软件 OpenGL）
+# 3) 真实窗口交互测试（需要图形显示）: 鼠标点击拾取 / 联动 / 拖动不误触 / 投影 / 改名后拾取
+DISPLAY=:0 python -m foamgui.tests.interaction_gui airFoil2D
+#    -> [OK] 交互测试通过
+
+# 4) 离屏渲染网格图（软件 OpenGL）
 LIBGL_ALWAYS_SOFTWARE=1 python -m foamgui.tests.render_preview airFoil2D _scratch
 
-# 4) 端到端：用推荐 BC 重新生成整套字典，再用 OpenFOAM 13 真跑
+# 5) 端到端：用推荐 BC 重新生成整套字典，再用 OpenFOAM 13 真跑
 python -m foamgui.tests.e2e_openfoam airFoil2D
 #    -> foamDictionary 校验全部通过; foamRun 返回码 0, 生成 5/ 结果目录
 ```
 
-第 4 项在 airFoil2D 上的实际输出（节选）：
+第 5 项在 airFoil2D 上的实际输出（节选）：
 
 ```
 [2] 读取完成: 场=['U', 'nuTilda', 'nut', 'p'] 补片=['inlet', 'outlet', 'walls', 'frontAndBack']

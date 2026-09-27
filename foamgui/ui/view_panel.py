@@ -59,10 +59,9 @@ class MeshView(QtWidgets.QWidget):
             self.interactor = self.render_window.GetInteractor()
             if self.interactor is not None:
                 self.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
-                # 用"按下/抬起之间没有拖动"来区分单击(拾取)和拖动(旋转)
-                self.interactor.AddObserver("LeftButtonPressEvent", self._on_press)
-                self.interactor.AddObserver("MouseMoveEvent", self._on_move)
-                self.interactor.AddObserver("LeftButtonReleaseEvent", self._on_release)
+            # 拾取在 Qt 层处理(见 _on_* ): VTK 的 LeftButtonReleaseEvent 在本版本
+            # 由 QVTK 转发时不会真正派发, 挂在交互器上收不到, 所以不依赖它。
+            self.vtk_widget.installEventFilter(self)
 
             self._marker = vtkOrientationMarkerWidget()
             self._marker.SetOrientationMarker(self.scene.axes_actor)
@@ -79,28 +78,37 @@ class MeshView(QtWidgets.QWidget):
             self._placeholder.setWordWrap(True)
             layout.addWidget(self._placeholder)
 
-    # -- 拾取 ---------------------------------------------------------------
-    def _on_press(self, obj, _event) -> None:
-        self._press_pos = obj.GetEventPosition()
-        self._dragged = False
+    # -- 拾取(在 Qt 层处理鼠标事件) ------------------------------------------
+    def _to_vtk_coords(self, pos) -> tuple[int, int]:
+        """Qt 控件坐标 -> VTK 显示坐标(与 QVTK 内部的换算保持一致)。"""
+        widget = self.vtk_widget
+        dpr = widget.devicePixelRatio()
+        return (
+            int(round(pos.x() * dpr)),
+            int(round((widget.height() - pos.y() - 1) * dpr)),
+        )
 
-    def _on_move(self, obj, _event) -> None:
-        if self._press_pos is None:
-            return
-        x, y = obj.GetEventPosition()
-        if abs(x - self._press_pos[0]) > 4 or abs(y - self._press_pos[1]) > 4:
-            self._dragged = True
-
-    def _on_release(self, obj, _event) -> None:
-        pos, dragged = self._press_pos, self._dragged
-        self._press_pos = None
-        self._dragged = False
-        if pos is None or dragged:
-            return
-        x, y = obj.GetEventPosition()
-        name = self.scene.pick_patch(x, y)
-        if name:
-            self.patchClicked.emit(name)
+    def eventFilter(self, obj, event):  # noqa: N802
+        if obj is not self.vtk_widget or self.vtk_widget is None:
+            return False
+        etype = event.type()
+        if etype == QtCore.QEvent.Type.MouseButtonPress and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._press_pos = event.position()
+            self._dragged = False
+        elif etype == QtCore.QEvent.Type.MouseMove and self._press_pos is not None:
+            p = event.position()
+            if abs(p.x() - self._press_pos.x()) > 4 or abs(p.y() - self._press_pos.y()) > 4:
+                self._dragged = True
+        elif etype == QtCore.QEvent.Type.MouseButtonRelease and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            pos, dragged = self._press_pos, self._dragged
+            self._press_pos = None
+            self._dragged = False
+            if pos is not None and not dragged:
+                x, y = self._to_vtk_coords(event.position())
+                name = self.scene.pick_patch(x, y)
+                if name:
+                    self.patchClicked.emit(name)
+        return False  # 不拦截, 旋转/平移仍由 VTK 的交互样式处理
 
     # -- 对外接口 -----------------------------------------------------------
     @property
