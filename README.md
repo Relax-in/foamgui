@@ -211,6 +211,8 @@ foamgui/
     ├── render_preview.py     # 离屏渲染网格预览图
     └── e2e_openfoam.py       # 端到端：写字典 + foamRun 真跑
 run_foamgui.sh                # 启动脚本(venv + Qt 依赖检查 + OpenFOAM 环境)
+push_github.sh                # 推送到 GitHub(SSH over 443)
+tools/push_via_api.py         # 备用推送通道(GitHub REST API, 绕开被墙的 git 端口)
 vendor/lib/                   # libxcb-cursor 兜底副本(见 vendor/README.md)
 docs/                         # 文档图片
 ```
@@ -244,7 +246,34 @@ python -m foamgui.tests.e2e_openfoam airFoil2D
 [OK] 端到端验证通过: 生成的字典可以被 OpenFOAM 13 正常求解
 ```
 
-## 7. 已知限制 / 下一步
+## 7. 版本备份（GitHub）
+
+代码已推送到 GitHub：**<https://github.com/Relax-in/foamgui>**
+
+```bash
+./push_github.sh                    # 推送到 Relax-in/foamgui
+./push_github.sh <用户名> <仓库名>   # 推到别处
+```
+
+* 本机 `github.com` 的 22 端口时通时不通，脚本固定走 **SSH over 443**
+  （`ssh://git@ssh.github.com:443/...`），复用你已登记在 GitHub 的 `~/.ssh/id_ed25519`；
+* 若某天 git 传输完全不通，还有 REST API 备用通道（实测 `api.github.com` 一直可用，
+  而 `github.com` 的网页与 git 端口会被墙）：
+
+  ```bash
+  echo 'github_pat_xxx' > ~/.foamgui_token && chmod 600 ~/.foamgui_token
+  python3 tools/push_via_api.py --repo foamgui --private
+  ```
+
+  它会用 Git Data API 建仓库并上传当前 HEAD 的完整快照，全程不经过 `github.com`。
+
+本地还有一份可克隆的裸仓库备份（含完整提交历史，已被 `.gitignore` 忽略）：
+
+```bash
+git clone .backup/foamgui.git /tmp/foamgui-check
+```
+
+## 8. 已知限制 / 下一步
 
 * **只读网格、不生成网格**：目前不含 `blockMesh`/`snappyHexMesh` 的图形化建模，网格还是用 OpenFOAM 生成；
 * **场数据不显示**：三维窗口目前只显示网格几何与单元体积，还没有把 `U/p` 的计算结果映射上去（下一步可以加 `foamToVTK` 或直接读 `polyMesh` 的场文件做云图）；
