@@ -18,55 +18,52 @@ solvers
 {
     p
     {
-        solver          GAMG;
-        tolerance       1e-06;
-        relTol          0.1;
-        smoother        GaussSeidel;
+        solver GAMG;
+        tolerance 1e-06;
+        relTol 0.1;
+        smoother GaussSeidel;
     }
-
     U
     {
-        solver          smoothSolver;
-        smoother        GaussSeidel;
-        nSweeps         2;
-        tolerance       1e-08;
-        relTol          0.1;
+        solver smoothSolver;
+        smoother GaussSeidel;
+        nSweeps 2;
+        tolerance 1e-08;
+        relTol 0.1;
     }
-
     nuTilda
     {
-        solver          smoothSolver;
-        smoother        GaussSeidel;
-        nSweeps         2;
-        tolerance       1e-08;
-        relTol          0.1;
+        solver smoothSolver;
+        smoother GaussSeidel;
+        nSweeps 2;
+        tolerance 1e-08;
+        relTol 0.1;
     }
 }
-
 SIMPLE
 {
     nNonOrthogonalCorrectors 0;
-
     residualControl
     {
-        p               1e-5;
-        U               1e-5;
-        nuTilda         1e-5;
+        p 1e-5;
+        U 1e-5;
+        nuTilda 1e-5;
     }
+    consistent yes;
+    pRefCell 0;
+    pRefValue 0;
 }
-
 relaxationFactors
 {
     fields
     {
-        p               0.3;
+        p 0.3;
     }
     equations
     {
-        U               0.7;
-        nuTilda         0.7;
+        U 0.7;
+        nuTilda 0.7;
     }
 }
-
 
 // ************************************************************************* //

@@ -15,13 +15,11 @@ FoamFile
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 simulationType RAS;
-
 RAS
 {
-    model           SpalartAllmaras;
-
-    turbulence      on;
-
+    model SpalartAllmaras;
+    turbulence on;
+    printCoeffs true;
 }
 
 // ************************************************************************* //

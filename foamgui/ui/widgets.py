@@ -203,11 +203,12 @@ def add_atom_row(
     on_change: Callable[[], None] | None = None,
 ) -> QtWidgets.QWidget:
     """往表单里加一行, 编辑字典 ``d[key]`` 的原子值。返回创建的控件。"""
+    # 注意: 字典里没有这个条目时, 只在界面上显示默认值, **不写回字典**。
+    # 只有用户真的改了控件, 才会写进去 —— 这样"没碰过的条目"保持原样,
+    # 不会因为打开一次面板就悄悄给案例加一堆默认条目。
     value = dictfile.get_atom(d, key, None)
     if value is None:
         value = default
-        if key not in d and default != "":
-            d.set(key, default)
 
     if kind == "bool":
         w = QtWidgets.QCheckBox()
