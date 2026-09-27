@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时产物 / 临时目录
+.verify/
+_scratch/
+.scratch/
+*.log
+
+# OpenFOAM: 结果时间目录与日志
+[1-9]*/
+log.*
+foamgui_backup/
+*.orig
+*.bak
