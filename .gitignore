@@ -17,3 +17,6 @@ log.*
 foamgui_backup/
 *.orig
 *.bak
+
+# 本地裸仓库备份(版本历史)
+.backup/
