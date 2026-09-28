@@ -201,6 +201,7 @@ def add_atom_row(
     default: str = "",
     tooltip: str = "",
     on_change: Callable[[], None] | None = None,
+    editable: bool = True,
 ) -> QtWidgets.QWidget:
     """往表单里加一行, 编辑字典 ``d[key]`` 的原子值。返回创建的控件。"""
     # 注意: 字典里没有这个条目时, 只在界面上显示默认值, **不写回字典**。
@@ -214,16 +215,23 @@ def add_atom_row(
         w = QtWidgets.QCheckBox()
         w.setChecked(str(value).lower() in ("1", "true", "yes", "on"))
         w.toggled.connect(lambda v: (d.set(key, "true" if v else "false"), _call(on_change)))
+        w._foam_commit = lambda: d.set(key, "true" if w.isChecked() else "false")  # type: ignore[attr-defined]
     elif kind == "choice":
         w = QtWidgets.QComboBox()
-        w.setEditable(True)
-        if choices:
-            w.addItems(choices)
+        w.setEditable(editable)
+        items = list(choices or [])
+        # 不(允许自由输入)时, 也要把字典里现有的值显示出来, 不能悄悄显示成别的
+        if str(value) and str(value) not in items:
+            items.append(str(value))
+        if items:
+            w.addItems(items)
         w.setCurrentText(str(value))
         w.currentTextChanged.connect(lambda t: (d.set(key, t), _call(on_change)))
+        w._foam_commit = lambda: d.set(key, w.currentText())  # type: ignore[attr-defined]
     else:
         w = QtWidgets.QLineEdit(str(value))
         w.textChanged.connect(lambda t: (d.set(key, t), _call(on_change)))
+        w._foam_commit = lambda: d.set(key, w.text())  # type: ignore[attr-defined]
     if tooltip:
         w.setToolTip(tooltip)
     lab = QtWidgets.QLabel(label)
@@ -267,9 +275,48 @@ def add_dimensioned_row(
     edit.textChanged.connect(
         lambda t: (d.set(key, Dimensioned(dims, t.strip() or "0")), _call(on_change))
     )
+    edit._foam_commit = lambda: d.set(  # type: ignore[attr-defined]
+        key, Dimensioned(dims, edit.text().strip() or "0")
+    )
     lay.addWidget(edit, 1)
     form.addRow(QtWidgets.QLabel(label), box)
     return edit
+
+
+def commit_form(form: QtWidgets.QFormLayout) -> int:
+    """把表单里所有控件"当前显示的值"写进它们绑定的字典条目。
+
+    平时只有用户改动过的条目才会写回字典(没碰过的保持原样); 这个函数用于
+    "把界面上显示的值(含默认值)全部落盘"这种显式操作, 例如给一个缺
+    pRefCell/pRefValue 的案例补齐必需条目。
+
+    返回提交的条目数。
+    """
+    n = 0
+    for item in _iter_field_widgets(form):
+        commit = getattr(item, "_foam_commit", None)
+        if commit is not None:
+            commit()
+            n += 1
+    return n
+
+
+def _iter_field_widgets(form: QtWidgets.QFormLayout):
+    stack: list[QtWidgets.QLayout] = [form]
+    while stack:
+        lay = stack.pop()
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is not None:
+                yield w
+                child = w.layout()
+                if child is not None:
+                    stack.append(child)
+            elif item.layout() is not None:
+                stack.append(item.layout())
 
 
 def _call(fn: Callable[[], None] | None) -> None:

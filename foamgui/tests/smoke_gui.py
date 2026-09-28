@@ -178,6 +178,42 @@ def main(argv: list[str]) -> int:
     assert new1 in scene_colors and p1 not in scene_colors, "三维场景里的补片索引没同步改名"
     print(f"[3i] 模型树双击改名 {p1} -> {new1} 正常(场景索引也同步)", flush=True)
 
+    # controlDict 的求解器: 老案例只有 application 时, 改动必须写到 solver
+    from foamgui.foam import dictfile as _df
+
+    cd = case.control_dict()
+    if "solver" in cd:
+        del cd["solver"]
+    cd.set("application", "UserSolver")          # 造出"老式写法"的案例
+    win.solver_tab.set_case(case)
+    app.processEvents()
+    form = win.solver_tab.control_form
+    combo = None
+    for row in range(form.rowCount()):
+        item = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.FieldRole)
+        if item is not None and isinstance(item.widget(), QtWidgets.QComboBox):
+            combo = item.widget()
+            break
+    assert combo is not None, f"求解设置页里找不到求解器下拉框(共 {form.rowCount()} 行)"
+    combo.setCurrentText("incompressibleFluid")
+    app.processEvents()
+    text = case.render_all()["system/controlDict"]
+    assert _df.get_atom(cd, "solver", "") == "incompressibleFluid", \
+        f"改动后应当写入 solver, 实际 solver={_df.get_atom(cd, 'solver')!r}"
+    assert "solver incompressibleFluid;" in text, "写出的 controlDict 里没有 solver incompressibleFluid;"
+    assert _df.get_atom(cd, "application", "") == "UserSolver", "老式 application 条目不应被改动"
+    print("[3j] 求解器始终写入 solver(老式 application 案例也正确)", flush=True)
+
+    # 显式"把当前显示的值写入字典": 应当补齐 pRefCell/pRefValue 这类条目
+    before_keys = [k for k, _ in _df.get_dict(case.render_all() and case.get("system", "fvSolution"), "SIMPLE").items] \
+        if _df.get_dict(case.get("system", "fvSolution"), "SIMPLE") else []
+    win.solver_tab._commit_all()
+    app.processEvents()
+    sim = _df.get_dict(case.get("system", "fvSolution"), "SIMPLE")
+    assert sim is not None and "pRefCell" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefCell"
+    assert "pRefValue" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefValue"
+    print(f"[3k] 『把当前显示的值写入字典』正常(SIMPLE 现在有 {sim.keys()})", flush=True)
+
     # 写出到临时目录
     written, _ = case.write(out_dir=out_dir, backup=False)
     print(f"[4] 写出 {len(written)} 个文件到 {out_dir}", flush=True)

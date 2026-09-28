@@ -9,8 +9,9 @@ from __future__ import annotations
 from PyQt6 import QtCore, QtWidgets
 
 from ..foam import dictfile
+from ..foam import fields as fields_mod
 from ..foam.dictfile import FoamDict
-from .widgets import add_atom_row, add_dimensioned_row
+from .widgets import add_atom_row, add_dimensioned_row, commit_form
 
 __all__ = ["SolverTab"]
 
@@ -67,6 +68,19 @@ class SolverTab(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(host)
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(10)
+        bar = QtWidgets.QHBoxLayout()
+        self.btn_commit = QtWidgets.QPushButton("把当前显示的值写入字典")
+        self.btn_commit.setToolTip(
+            "平时只有你改动过的条目才会写进字典(没碰过的保持原样)。\n"
+            "点这里会把所有页签上显示的条目(包括默认值)都写进去,\n"
+            "适合给缺少必需条目的案例(例如缺 pRefCell/pRefValue)一次性补齐。"
+        )
+        self.btn_commit.clicked.connect(self._commit_all)
+        bar.addWidget(self.btn_commit)
+        self.lbl_commit = QtWidgets.QLabel("")
+        self.lbl_commit.setEnabled(False)
+        bar.addWidget(self.lbl_commit, 1)
+        v.addLayout(bar)
         v.addWidget(self._build_control_dict())
         v.addWidget(self._build_turbulence())
         v.addWidget(self._build_physical())
@@ -148,6 +162,7 @@ class SolverTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def set_case(self, case) -> None:
         self.case = case
+        self.lbl_commit.setText("")
         self._loading = True
         try:
             self._fill_control_dict()
@@ -173,14 +188,25 @@ class SolverTab(QtWidgets.QWidget):
         d = self.case.control_dict() if self.case else FoamDict()
         self._cd = d
         cb = self.changed.emit
-        # OpenFOAM 10 之前叫 application, 之后叫 solver; 有的前处理工具导出的
-        # 还是 application, 这里认哪个就用哪个, 不要凭空多写一条。
-        solver_key = "solver"
+        # OpenFOAM 13 只认 `solver`(10 之前叫 `application`), 所以这里**永远写 solver**。
+        # 但如果案例里只有老式的 `application`, 就把它的值显示出来当初始值, 并给出提示;
+        # 用户改动后会新增/更新 `solver`, 原来的 `application` 原样保留(不静默删用户的东西)。
+        legacy = None
         if "solver" not in d and "application" in d:
-            solver_key = "application"
-        add_atom_row(f, d, solver_key, "求解器 solver/application", "choice",
-                     SOLVERS_INCOMPRESSIBLE + SOLVERS_COMPRESSIBLE, "incompressibleFluid",
-                     "OpenFOAM 13 用 foamRun + 模块名(写 solver); 老案例可能是 application", cb)
+            legacy = dictfile.get_atom(d, "application", "") or ""
+        add_atom_row(f, d, "solver", "求解器 solver", "choice",
+                     SOLVERS_INCOMPRESSIBLE + SOLVERS_COMPRESSIBLE,
+                     legacy or "incompressibleFluid",
+                     "OpenFOAM 13 用 foamRun + 模块名, 必须写成 solver incompressibleFluid;", cb)
+        if legacy:
+            hint = QtWidgets.QLabel(
+                f"⚠ 该案例用的是老式写法 <code>application {legacy};</code>,"
+                "OpenFOAM 13 需要 <code>solver</code>;<br>在这里选择后会把 "
+                "<code>solver</code> 写进 controlDict(原 application 条目保留不动)。"
+            )
+            hint.setWordWrap(True)
+            hint.setEnabled(False)
+            f.addRow(hint)
         add_atom_row(f, d, "startFrom", "startFrom", "choice",
                      ["startTime", "latestTime", "firstTime"], "startTime", "", cb)
         add_atom_row(f, d, "startTime", "startTime", "text", None, "0", "", cb)
@@ -208,26 +234,71 @@ class SolverTab(QtWidgets.QWidget):
         d = self.case.constant.get("momentumTransport", (FoamDict(), ""))[0] if self.case else FoamDict()
         self._mt = d
         add_atom_row(f, d, "simulationType", "simulationType", "choice",
-                     ["laminar", "RAS", "LES"], "RAS", "层流 / 雷诺平均 / 大涡模拟", self._on_sim_type)
+                     ["laminar", "RAS", "LES"], "RAS", "层流 / 雷诺平均 / 大涡模拟",
+                     self._on_sim_type, editable=False)
         sim = dictfile.get_atom(d, "simulationType", "RAS")
         if sim in ("RAS", "LES"):
             sub = dictfile.get_dict(d, sim)
             if sub is None:
                 sub = FoamDict()
                 d.set(sim, sub)
+            # 模型只能从列表里选: 否则容易写出 RAS { model laminar; } 这种非法组合
             add_atom_row(f, sub, "model", f"{sim} 模型", "choice",
                          RAS_MODELS if sim == "RAS" else LES_MODELS,
-                         "SpalartAllmaras" if sim == "RAS" else "Smagorinsky", "", self.changed.emit)
+                         "SpalartAllmaras" if sim == "RAS" else "Smagorinsky",
+                         "只能从列表里选; 要算层流请把上面的 simulationType 改成 laminar",
+                         self._on_model_changed, editable=False)
             add_atom_row(f, sub, "turbulence", "turbulence", "choice", ["on", "off"], "on", "", self.changed.emit)
+            cur_model = dictfile.get_atom(sub, "model", "") or ""
+            valid = RAS_MODELS if sim == "RAS" else LES_MODELS
+            if cur_model and cur_model not in valid:
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda m=cur_model, s=sim: self.statusMessage.emit(
+                        f"⚠ constant/momentumTransport 里是 {s} {{ model {m}; }}, "
+                        f"但 {m} 不在 {s} 模型列表里(求解器会报错); "
+                        "要层流请把 simulationType 改成 laminar, 否则请重新选一个模型"
+                    ),
+                )
             add_atom_row(f, sub, "printCoeffs", "printCoeffs", "bool", None, "true", "", self.changed.emit)
         else:
             hint = QtWidgets.QLabel("层流: 只需要 0/U 与 0/p, 湍流场可以不要")
             hint.setEnabled(False)
             f.addRow(hint)
 
+    def _commit_all(self) -> None:
+        """把各表单当前显示的值全部写进字典(显式补齐默认条目)。"""
+        n = 0
+        for form in (self.control_form, self.turb_form, self.phys_form,
+                     self.scheme_form, self.solution_form):
+            n += commit_form(form)
+        self.changed.emit()
+        self.lbl_commit.setText(f"已写入 {n} 个条目")
+        self.statusMessage.emit(f"求解设置: 已把 {n} 个条目写入字典(可在生成字典页预览)")
+
     def _on_sim_type(self, *_a) -> None:
         self._fill_turbulence()
         self.changed.emit()
+
+    def _on_model_changed(self, *_a) -> None:
+        """切换湍流模型后, 提示需要在 0/ 里准备哪些场。"""
+        self.changed.emit()
+        if self.case is None:
+            return
+        sim = dictfile.get_atom(self._mt, "simulationType", "laminar")
+        if sim == "laminar":
+            return
+        sub = dictfile.get_dict(self._mt, sim)
+        model = dictfile.get_atom(sub, "model", "") if sub else ""
+        needed = fields_mod.TURBULENCE_FIELDS.get(model or "", [])
+        missing = [n for n in needed if n not in self.case.fields]
+        if missing:
+            self.statusMessage.emit(
+                f"模型 {model} 需要场 {'、'.join(needed)}; 当前缺少 {'、'.join(missing)},"
+                " 请到『初始条件』页添加(否则求解器会报找不到场)"
+            )
+        else:
+            self.statusMessage.emit(f"模型 {model} 需要的场都已存在: {'、'.join(needed) or '(无)'}")
 
     # -- 物性 -----------------------------------------------------------
     def _fill_physical(self) -> None:

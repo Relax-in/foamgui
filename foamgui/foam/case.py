@@ -346,7 +346,13 @@ class FoamCase:
             self.system["fvSolution"] = (_default_fv_solution(self.field_categories()), "dictionary")
             self.warnings.append("未找到 system/fvSolution, 已使用默认值")
         if "momentumTransport" not in self.constant:
-            self.constant["momentumTransport"] = (_default_momentum_transport(), "dictionary")
+            self.constant["momentumTransport"] = (
+                _default_momentum_transport(self.fields),
+                "dictionary",
+            )
+            sim = dictfile.get_atom(self.constant["momentumTransport"][0], "simulationType", "")
+            if sim:
+                self.warnings.append(f"未找到 constant/momentumTransport, 已按案例里的场选择 {sim}")
         if "physicalProperties" not in self.constant:
             self.constant["physicalProperties"] = (_default_physical_properties(), "dictionary")
 
@@ -569,12 +575,31 @@ def _default_fv_solution(categories: dict[str, tuple[str, str]]) -> FoamDict:
     return d
 
 
-def _default_momentum_transport() -> FoamDict:
+def _default_momentum_transport(fields: dict | None = None) -> FoamDict:
+    """给缺少 constant/momentumTransport 的案例一个合理默认。
+
+    关键: **按案例里实际存在的湍流场来选模型**。如果案例里没有 nuTilda/k/omega
+    这些场, 就选 laminar —— 否则求解器会因为找不到模型需要的场而报错。
+    """
+    names = set(fields or {})
     d = FoamDict()
-    d.set("simulationType", "RAS")
-    ras = FoamDict()
-    ras.set("model", "SpalartAllmaras")
-    d.set("RAS", ras)
+    if "nuTilda" in names:
+        d.set("simulationType", "RAS")
+        sub = FoamDict()
+        sub.set("model", "SpalartAllmaras")
+        d.set("RAS", sub)
+    elif "epsilon" in names and "k" in names:
+        d.set("simulationType", "RAS")
+        sub = FoamDict()
+        sub.set("model", "kEpsilon")
+        d.set("RAS", sub)
+    elif "omega" in names and "k" in names:
+        d.set("simulationType", "RAS")
+        sub = FoamDict()
+        sub.set("model", "kOmegaSST")
+        d.set("RAS", sub)
+    else:
+        d.set("simulationType", "laminar")
     return d
 
 

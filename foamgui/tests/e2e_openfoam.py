@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -49,7 +50,8 @@ def _looks_like_solver(name: str) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    src = Path(argv[1] if len(argv) > 1 else "airFoil2D").resolve()
+    positional = [a for a in argv[1:] if not a.startswith("-")]
+    src = Path(positional[0] if positional else "airFoil2D").resolve()
     if not src.is_dir():
         print(f"案例目录不存在: {src}")
         return 2
@@ -71,7 +73,9 @@ def main(argv: list[str]) -> int:
 
     cd = case.control_dict()
     solver_name = (_df.get_atom(cd, "solver") or _df.get_atom(cd, "application") or "").strip()
-    runnable = _looks_like_solver(solver_name)
+    # --no-run: 只校验网格与字典(案例物理还没配好时用)
+    force_no_run = "--no-run" in sys.argv[1:] or os.environ.get("FOAMGUI_E2E_NO_RUN") == "1"
+    runnable = _looks_like_solver(solver_name) and not force_no_run
     print(f"    求解器: {solver_name!r} -> {'尝试运行' if runnable else '只校验网格'}", flush=True)
 
     # 用推荐边界条件重排所有场(相当于在 GUI 里点"按补片名推荐边界条件")
@@ -121,7 +125,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     if not runnable:
-        print("[7] 该案例原本没有 fvSchemes/fvSolution(导出工具生成的网格), 跳过 foamRun", flush=True)
+        print("[7] 求解器是占位名或指定了 --no-run, 跳过 foamRun(只校验网格与字典)", flush=True)
         print("[OK] 端到端验证通过(网格读取 + 字典写出 + checkMesh)", flush=True)
         shutil.rmtree(work, ignore_errors=True)
         return 0

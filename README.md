@@ -151,7 +151,20 @@ rm -rf vendor/
 
 * **controlDict**：`solver`（OpenFOAM 13 用 `foamRun` + 模块名，如 `incompressibleFluid`）、
   `startFrom/startTime/stopAt/endTime/deltaT`、写出控制、`writeFormat`、自适应时间步…
-* **momentumTransport**：`simulationType`（laminar/RAS/LES）、模型（`SpalartAllmaras`、`kOmegaSST`…）；
+  * **求解器永远写成 `solver`**：OpenFOAM 13 只认 `solver`（10 之前才叫 `application`）。
+    如果案例里只有老式的 `application`，界面会把它的值显示出来当初始值并给出提示；
+    你改动后写入的是 `solver`，原来的 `application` 条目保持不动（原始文件另在
+    `foamgui_backup/` 有备份）。
+* 顶部有 **「把当前显示的值写入字典」** 按钮：平时只有你改动过的条目才会写进字典
+  （没碰过的保持原样）；点这个按钮会把各页签上显示的值（含默认值）一次性写进去，
+  适合给缺少必需条目的案例补齐，例如压力参考 `pRefCell`/`pRefValue`。
+* **momentumTransport**：`simulationType`（laminar/RAS/LES）、模型（`SpalartAllmaras`、`kOmegaSST`…）。
+  * 模型只能从列表里选（避免写出 `RAS { model laminar; }` 这种非法组合，求解器会因此报错）；
+    读到这种非法组合时状态栏会给出警告；
+  * 案例缺少 `constant/momentumTransport` 时，会**按案例里实际存在的湍流场**决定默认值：
+    有 `nuTilda` → SpalartAllmaras，有 `k`+`epsilon` → kEpsilon，有 `k`+`omega` → kOmegaSST，
+    什么湍流场都没有 → **laminar**（否则求解器会报"找不到模型需要的场"）；
+  * 切换模型后状态栏会提示该模型需要通过 `0/` 里哪些场。
 * **physicalProperties**：`viscosityModel`、`rho`、`nu`（带量纲，只改数值）；
 * **fvSchemes**：`ddt/grad/laplacian/interpolation/snGrad` 的 default，以及 `divSchemes` 明细表格
   （可增删行，支持 `div(phi,U)` 这类带括号的键）；
@@ -341,6 +354,9 @@ git clone .backup/foamgui.git /tmp/foamgui-check
   `snappyHexMesh` 的 `meshQualityDict` 等按名字写死的设置，需要自己检查；
 * **BC 目录是常见子集**：特殊求解器的专属边界条件没有全部收录，但可以用"其他参数（原样保留）"手工填；
 * **`0.orig`**：会优先读 `controlDict` 的 `startTime`，其次读 `0/`，最后才是 `0.orig`；
+* **案例能不能跑取决于物理设置**：工具只保证网格/字典**格式正确**。像只导出过网格的算例
+  （例如 ANSA 导出的 `111`），还需要自己确认求解器模块、湍流模型、压力参考（`pRefCell`）、
+  边界条件等 —— 缺少时 OpenFOAM 会给出明确报错，按报错在界面上补即可；
 * **GUI 启动的环境依赖**：见 2.1 节，Qt 6.5+ 需要 `libxcb-cursor0`，项目已带兜底副本；
 * **第三方工具导出的网格**已兼容（ANSA 风格的文件头与 `-1` 占位 `neighbour`），但这类工具常把
   补片类型全写成 `wall`，实际用途要靠名字判断（工具会按名字推荐边界条件，仍需人工确认）；
