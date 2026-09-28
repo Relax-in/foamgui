@@ -28,8 +28,12 @@ class MeshError(Exception):
     """网格读取失败。"""
 
 
-# 文件头的结束行: // * * * * * * * * * //
-_SEP_RE = re.compile(rb"^[ \t]*//\s*(?:\*\s*)+//[ \t]*$", re.M)
+# 文件头的结束行: // * * * * * * * * * //  (容忍 Windows 的 CRLF)
+_SEP_RE = re.compile(rb"^[ \t]*//\s*(?:\*\s*)+//[ \t\r]*$", re.M)
+# FoamFile 字典的起点: 用于没有标准分隔行的文件(ANSA / Pointwise 等工具导出)
+_FOAMFILE_RE = re.compile(rb"FoamFile\s*\{")
+# 找 FoamFile 字典结尾时最多扫描多少字节
+_HEADER_SCAN_LIMIT = 1 << 20
 
 
 @dataclass
@@ -288,12 +292,66 @@ def find_polymesh_dir(case_dir: str | Path) -> Path:
     raise MeshError(f"在 {case} 下找不到 constant/polyMesh")
 
 
-def _split_header(raw: bytes) -> tuple[str, bytes]:
-    m = _SEP_RE.search(raw)
+def _find_foamfile_end(raw: bytes) -> int | None:
+    """找 ``FoamFile { ... }`` 的结束位置。
+
+    正常的 OpenFOAM 文件在 FoamFile 之后有一行 ``// * * * * //`` 作为分隔,
+    但有些前处理工具(例如 ANSA)导出时用的是 ``/*---*/`` 注释, 没有那一行,
+    这时就靠 FoamFile 字典本身来定位正文。
+    """
+    m = _FOAMFILE_RE.search(raw[: _HEADER_SCAN_LIMIT])
     if not m:
-        raise MeshError("文件缺少 OpenFOAM 文件头分隔行(// * * * //)")
-    header = raw[: m.end()].decode("utf-8", errors="replace")
-    return header, raw[m.end() :]
+        return None
+    depth = 0
+    i = m.end() - 1  # 指向 '{'
+    end = min(len(raw), m.end() + _HEADER_SCAN_LIMIT)
+    while i < end:
+        c = raw[i]
+        if c == 0x7B:  # {
+            depth += 1
+        elif c == 0x7D:  # }
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _skip_leading_noise(raw: bytes) -> bytes:
+    """跳过正文开头的空白与注释(有的工具会在 FoamFile 之后再加几行注释)。"""
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i : i + 1]
+        if c.isspace():
+            i += 1
+        elif raw[i : i + 2] == b"/*":
+            j = raw.find(b"*/", i + 2)
+            if j < 0:
+                break
+            i = j + 2
+        elif raw[i : i + 2] == b"//":
+            j = raw.find(b"\n", i)
+            if j < 0:
+                break
+            i = j + 1
+        else:
+            break
+    return raw[i:]
+
+
+def _split_header(raw: bytes) -> tuple[str, bytes]:
+    """把文件切成 (头部文本, 正文)。
+
+    优先用标准的 ``// * * * * //`` 分隔行; 没有的话退化为按 FoamFile 字典定位,
+    这样 ANSA / Pointwise 等工具导出的网格也能读。
+    """
+    m = _SEP_RE.search(raw)
+    if m:
+        return raw[: m.end()].decode("utf-8", errors="replace"), raw[m.end() :]
+    end = _find_foamfile_end(raw)
+    if end is None:
+        raise MeshError("文件里既没有 '// * * * //' 分隔行, 也没有 FoamFile 字典")
+    return raw[:end].decode("utf-8", errors="replace"), _skip_leading_noise(raw[end:])
 
 
 def _header_info(header_text: str) -> tuple[str, str]:
@@ -469,6 +527,7 @@ def _read_mesh_files(mesh_dir: Path) -> tuple[np.ndarray, list[np.ndarray], np.n
     for name in ("points", "faces", "owner", "neighbour"):
         raw = (mesh_dir / name).read_bytes()
         header_text, body = _split_header(raw)
+        body = _skip_leading_noise(body)
         fmt, _cls = _header_info(header_text)
         binary = fmt.startswith("binary")
         if binary:
@@ -503,7 +562,23 @@ def _read_mesh_files(mesh_dir: Path) -> tuple[np.ndarray, list[np.ndarray], np.n
     faces = result["faces"]  # type: ignore[assignment]
     owner = np.asarray(result["owner"], dtype=np.int32)
     neighbour = np.asarray(result["neighbour"], dtype=np.int32)
+    neighbour = _strip_padded_neighbour(neighbour)
     return points, faces, owner, neighbour, fmt_all
+
+
+def _strip_padded_neighbour(neighbour: np.ndarray) -> np.ndarray:
+    """去掉 neighbour 里给边界面占位的负数项。
+
+    标准 OpenFOAM 的 ``neighbour`` 只存内部面(长度 = nInternalFaces), 但有些
+    前处理工具(例如 ANSA)会按"每个面一项"来写, 边界面填 -1。这里把从第一个
+    负数开始的尾巴切掉, 恢复成标准语义。
+    """
+    if neighbour.size == 0:
+        return neighbour
+    negative = np.flatnonzero(neighbour < 0)
+    if negative.size == 0:
+        return neighbour
+    return neighbour[: int(negative[0])]
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +648,10 @@ def _validate(mesh: PolyMesh) -> None:
             raise MeshError(f"补片 {p.name} 的面范围超出网格范围")
     if mesh.n_points and mesh.face_points.size and int(mesh.face_points.max()) >= mesh.n_points:
         raise MeshError("面的点索引超出 points 范围")
+    if mesh.owner.size and int(mesh.owner.min()) < 0:
+        raise MeshError("owner 里出现负数单元号")
+    if mesh.neighbour.size and int(mesh.neighbour.min()) < 0:
+        raise MeshError("neighbour 里出现负数单元号(边界面占位项没有清理干净)")
 
 
 def read_polymesh(mesh_dir: str | Path) -> PolyMesh:
@@ -583,6 +662,17 @@ def read_polymesh(mesh_dir: str | Path) -> PolyMesh:
             raise MeshError(f"缺少网格文件: {mesh_dir / name}")
     points, faces, owner, neighbour, fmt = _read_mesh_files(mesh_dir)
     patches, boundary_body = read_boundary(mesh_dir / "boundary", with_body=True)
+
+    # boundary 文件里第一个补片的 startFace 就是内部面数, 用它兜底校正
+    # (例如 neighbour 少写/多写的时候)
+    if patches:
+        boundary_start = min(p.start_face for p in patches)
+        if boundary_start != neighbour.size:
+            if 0 <= boundary_start <= len(faces) and boundary_start <= neighbour.size:
+                neighbour = neighbour[:boundary_start]
+            elif 0 <= boundary_start <= len(owner):
+                neighbour = neighbour[: min(boundary_start, neighbour.size)]
+
     mesh = PolyMesh(points, faces, owner, neighbour, patches, fmt=fmt)
     mesh.boundary_body = boundary_body
     mesh.path = mesh_dir

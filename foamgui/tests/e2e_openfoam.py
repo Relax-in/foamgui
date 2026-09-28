@@ -25,6 +25,29 @@ from ..foam.case import FoamCase
 from ..foam.fields import apply_params, recommend_bc
 
 
+_MODULE_SOLVERS = {
+    "incompressiblefluid", "compressiblefluid", "fluid", "multicomponentfluid",
+    "incompressiblevof", "compressiblevof", "multiphaseeuler", "isothermalfluid",
+    "buoyantfluid", "shockfluid", "soliddisplacement", "solidthermo",
+    "potentialfluid", "potentialfoam", "shallowwaterfoam", "chmultiregionfluid",
+    "incompressiblemultiphasevof", "buoyantmultiphaseeuler",
+}
+
+
+def _looks_like_solver(name: str) -> bool:
+    """粗糙但够用的判断: 名字像 OpenFOAM 求解器才跑, 占位名(如 UserSolver)就跳过。"""
+    low = (name or "").strip().lower()
+    if not low or low in {"usersolver", "none", "unknown", "solver"}:
+        return False
+    if low in _MODULE_SOLVERS or low.endswith("foam"):
+        return True
+    return any(
+        low.startswith(p)
+        for p in ("incompressible", "compressible", "multiphase", "isothermal",
+                  "buoyant", "multicomponent", "shock", "solid", "potential", "shallow")
+    )
+
+
 def main(argv: list[str]) -> int:
     src = Path(argv[1] if len(argv) > 1 else "airFoil2D").resolve()
     if not src.is_dir():
@@ -40,6 +63,16 @@ def main(argv: list[str]) -> int:
     case.load()
     case.load_mesh()
     print(f"[2] 读取完成: 场={list(case.fields)} 补片={case.patch_names}", flush=True)
+    print(f"    网格: {case.mesh.summary()}", flush=True)
+    # 判断这个案例能不能真跑: 关键看求解器名字。
+    # 从 ANSA 之类工具导出的案例 controlDict 里是 `application UserSolver`,
+    # 这种只做 checkMesh 校验, 不强行跑求解器。
+    from foamgui.foam import dictfile as _df
+
+    cd = case.control_dict()
+    solver_name = (_df.get_atom(cd, "solver") or _df.get_atom(cd, "application") or "").strip()
+    runnable = _looks_like_solver(solver_name)
+    print(f"    求解器: {solver_name!r} -> {'尝试运行' if runnable else '只校验网格'}", flush=True)
 
     # 用推荐边界条件重排所有场(相当于在 GUI 里点"按补片名推荐边界条件")
     for name, ff in case.fields.items():
@@ -75,10 +108,28 @@ def main(argv: list[str]) -> int:
         print(f"    工作目录保留在 {work}")
         return 1
 
+    # checkMesh: 校验写出的网格文件(含被改名的 boundary)仍然合法
+    rc_cm, out_cm = ofenv.run_foam_tool(["checkMesh", "-case", str(case_dir)], timeout=600)
+    # 退出码 0 就说明网格文件能被 OpenFOAM 正确读入; 有些教程案例(airFoil2D)
+    # 本身会报一条 "Failed 1 mesh checks", 那是案例固有的, 不影响这里的目的
+    mesh_ok = rc_cm == 0
+    summary = [l.strip() for l in out_cm.splitlines() if "mesh checks" in l or "Mesh OK" in l]
+    print(f"[6] checkMesh 返回码 {rc_cm} | {' / '.join(summary) if summary else ''}", flush=True)
+    if not mesh_ok:
+        print("\n".join(out_cm.splitlines()[-15:]))
+        print(f"[失败] 写出后的网格不合法; 工作目录保留在 {work}")
+        return 1
+
+    if not runnable:
+        print("[7] 该案例原本没有 fvSchemes/fvSolution(导出工具生成的网格), 跳过 foamRun", flush=True)
+        print("[OK] 端到端验证通过(网格读取 + 字典写出 + checkMesh)", flush=True)
+        shutil.rmtree(work, ignore_errors=True)
+        return 0
+
     # 真正跑一下
     t0 = time.time()
     rc, out = ofenv.run_foam_tool(["foamRun", "-case", str(case_dir)], timeout=900)
-    print(f"[6] foamRun 返回码 {rc}, 用时 {time.time() - t0:.1f}s", flush=True)
+    print(f"[7] foamRun 返回码 {rc}, 用时 {time.time() - t0:.1f}s", flush=True)
     tail = "\n".join(out.strip().splitlines()[-25:])
     print("---- foamRun 输出(末 25 行) ----\n" + tail + "\n------------------------------", flush=True)
 

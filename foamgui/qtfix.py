@@ -115,9 +115,15 @@ def _reexec_with_clean_env(verbose: bool) -> None:
             "       为避免与 PyQt6 自带的 Qt6 版本冲突, 已用干净的库搜索路径重新启动界面。",
             file=sys.stderr,
         )
-    # 尽量保持原来的启动方式: `python -m foamgui ...` 或 `python 某脚本.py ...`
-    if os.path.basename(sys.argv[0] or "") == "__main__.py":
-        argv = [sys.executable, "-m", "foamgui"] + list(sys.argv[1:])
+    # 尽量保持原来的启动方式:
+    #   python -m foamgui ...        -> -m foamgui
+    #   python -m 包.模块 ...         -> 原样 -m 包.模块
+    #   python 脚本.py ... / -c ...   -> 原样
+    main_mod = sys.modules.get("__main__")
+    spec = getattr(main_mod, "__spec__", None)
+    mod_name = getattr(spec, "name", None) if spec is not None else None
+    if mod_name and mod_name != "__main__":
+        argv = [sys.executable, "-m", mod_name] + list(sys.argv[1:])
     else:
         argv = [sys.executable] + list(sys.argv)
     os.execve(sys.executable, argv, env)

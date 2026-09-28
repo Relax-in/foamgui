@@ -527,6 +527,12 @@ class MeshScene:
             return None
         self._ensure_pick_cache()
         ren = self.renderer
+        # 夹紧到渲染窗口范围内: 越界坐标(例如点在控件外面)会算出奇怪的射线,
+        # 极端情况下还会让 VTK 的交互/拾取路径崩溃
+        win_w, win_h = ren.GetSize()
+        if win_w > 0 and win_h > 0:
+            x = min(max(int(x), 0), win_w - 1)
+            y = min(max(int(y), 0), win_h - 1)
         ren.SetDisplayPoint(float(x), float(y), 0.0)
         ren.DisplayToWorld()
         p0 = list(ren.GetWorldPoint())

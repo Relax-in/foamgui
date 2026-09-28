@@ -264,24 +264,43 @@ def find_bc_type(category: str, name: str) -> BCType | None:
 # ---------------------------------------------------------------------------
 # 推荐边界条件
 # ---------------------------------------------------------------------------
-_INLET_HINTS = ("inlet", "in", "inflow", "freestream", "farfield", "far")
-_OUTLET_HINTS = ("outlet", "out", "outflow", "exit")
+_INLET_HINTS = ("inlet", "in", "inflow", "inflow", "freestream", "farfield", "far")
+_OUTLET_HINTS = ("outlet", "out", "outflow", "exit", "pressureoutlet")
+_WALL_HINTS = ("wall", "walls", "foil", "blade", "wing", "hub", "shroud", "surface", "body")
+
+
+def _tokens(name: str) -> list[str]:
+    """把补片名切成词: 支持下划线/点/中划线/驼峰(Patch.InletWall -> patch, inlet, wall)。"""
+    import re
+
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if t]
+
+
+def _hit(tokens: list[str], hints: tuple[str, ...]) -> bool:
+    return any(t == h or t.startswith(h) or t.endswith(h) for t in tokens for h in hints)
 
 
 def _classify_patch(name: str, ptype: str) -> str:
-    low = name.lower()
+    """按"类型 + 名字"判断补片属于哪一类。
+
+    名字比类型更可靠: 有的前处理工具(例如 ANSA)导出时把所有补片都写成
+    ``type wall``, 但名字仍然叫 ``Block.inlet``、``Block.outlet``。
+    """
+    toks = _tokens(name)
     if ptype in ("empty", "wedge"):
         return "empty"
-    if ptype == "symmetry" or "symmetry" in low or low in ("sym", "symm"):
+    if ptype == "symmetry" or _hit(toks, ("symmetry", "sym", "symm")):
         return "symmetry"
-    if ptype == "wall" or "wall" in low or "foil" in low or "blade" in low or "wing" in low:
+    # 名字里明确带 inlet/outlet 时优先按名字判断(否则会被 type wall 吞掉)
+    if _hit(toks, _OUTLET_HINTS):
+        return "outlet"
+    if _hit(toks, _INLET_HINTS):
+        return "inlet"
+    if _hit(toks, _WALL_HINTS):
         return "wall"
-    for h in _OUTLET_HINTS:
-        if low.startswith(h) or low.endswith(h) or h in low:
-            return "outlet"
-    for h in _INLET_HINTS:
-        if h in low:
-            return "inlet"
+    if ptype == "wall":
+        return "wall"
     if ptype == "patch":
         return "farfield"
     return "other"

@@ -131,6 +131,96 @@ def test_binary_mesh() -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_exporter_compat() -> None:
+    """兼容第三方前处理工具导出的网格(ANSA 风格)。
+
+    两个坑:
+    1. 文件头没有 OpenFOAM 标准的 ``// * * * * //`` 分隔行, 而是额外两行注释;
+    2. ``neighbour`` 按"每个面一项"写, 边界面用 -1 占位(标准 OpenFOAM 只写内部面)。
+    """
+    section("第三方导出格式兼容(ANSA 风格)")
+    from foamgui.foam import polymesh as pm
+
+    # 1) 头部: 没有标准分隔行, FoamFile 之后还有注释
+    fake = (
+        b"/*------------------------*\\\n"
+        b"|    ANSA_VERSION: 25.0.0   |\n"
+        b"\\*------------------------*/\n\n"
+        b"FoamFile\n{\n\tversion 2.0;\n\tformat ascii;\n\tclass vectorField;\n"
+        b'\tlocation "";\n\tobject points;\n}\n'
+        b"/*-------------------------------*/\n"
+        b"/*-------------------------------*/\n\n\n"
+        b"3\n(\n(0 0 0)\n(1 0 0)\n(0 1 0)\n)\n"
+    )
+    header, rest = pm._split_header(fake)
+    check("FoamFile" in header, "没有分隔行时应当能靠 FoamFile 定位头部")
+    body = pm._skip_leading_noise(rest)
+    check(body.startswith(b"3"), f"正文起点不对: {body[:12]!r}")
+
+    # 2) neighbour 的 -1 占位
+    import numpy as np
+
+    padded = np.array([3, 5, 7, -1, -1, -1], dtype=np.int32)
+    check(list(pm._strip_padded_neighbour(padded)) == [3, 5, 7], "-1 占位的 neighbour 没有清理")
+    clean = np.array([1, 2, 3], dtype=np.int32)
+    check(list(pm._strip_padded_neighbour(clean)) == [1, 2, 3], "标准 neighbour 被误改")
+
+    # 3) 端到端: 造一个"ANSA 风格"的单位立方体单胞网格
+    work = Path(tempfile.mkdtemp(prefix="foamgui_ansa_"))
+    try:
+        mesh_dir = work / "constant" / "polyMesh"
+        mesh_dir.mkdir(parents=True)
+        banner = (
+            "/*------------------------*\\\n"
+            "|    ANSA_VERSION: 25.0.0   |\n"
+            "\\*------------------------*/\n\n"
+        )
+        tail = "/*-------------------------------*/\n/*-------------------------------*/\n\n\n"
+
+        def write(name, cls, payload):
+            text = (
+                banner
+                + "FoamFile\n{\n\tversion 2.0;\n\tformat ascii;\n"
+                + f"\tclass {cls};\n\tlocation \"\";\n\tobject {name};\n}}\n"
+                + tail
+                + payload
+            )
+            (mesh_dir / name).write_text(text)
+
+        pts = [(x, y, z) for z in (0, 1) for y in (0, 1) for x in (0, 1)]
+        write("points", "vectorField",
+              f"{len(pts)}\n(\n" + "".join(f"({x} {y} {z})\n" for x, y, z in pts) + ")\n")
+        # 面的点序必须让法向朝外(OpenFOAM 的约定), 否则算出来的体积会错
+        cube_faces = [
+            (0, 2, 3, 1),  # z=0, 外法向 -z
+            (4, 5, 7, 6),  # z=1, 外法向 +z
+            (0, 1, 5, 4),  # y=0, 外法向 -y
+            (2, 6, 7, 3),  # y=1, 外法向 +y
+            (0, 4, 6, 2),  # x=0, 外法向 -x
+            (1, 3, 7, 5),  # x=1, 外法向 +x
+        ]
+        write("faces", "faceList",
+              f"{len(cube_faces)}\n(\n" + "".join("4(" + " ".join(map(str, f)) + ")\n" for f in cube_faces) + ")\n")
+        write("owner", "labelList", f"{len(cube_faces)}\n(\n" + "0\n" * len(cube_faces) + ")\n")
+        # 关键: 边界面也占一行, 填 -1
+        write("neighbour", "labelList", f"{len(cube_faces)}\n(\n" + "-1\n" * len(cube_faces) + ")\n")
+        write("boundary", "polyBoundaryMesh",
+              "2\n(\n\tbottom\n\t{\n\t\ttype patch;\n\t\tnFaces 1;\n\t\tstartFace 0;\n\t}\n"
+              "\trest\n\t{\n\t\ttype wall;\n\t\tnFaces 5;\n\t\tstartFace 1;\n\t}\n)\n")
+
+        mesh = pm.read_polymesh(mesh_dir)
+        check(mesh.n_points == 8, f"点数不对: {mesh.n_points}")
+        check(mesh.n_faces == 6, f"面数不对: {mesh.n_faces}")
+        check(mesh.n_internal_faces == 0, f"内部面数应为 0, 实际 {mesh.n_internal_faces}")
+        check(mesh.n_cells == 1, f"单元数不对: {mesh.n_cells}")
+        check(mesh.patch_names == ["bottom", "rest"], f"补片不对: {mesh.patch_names}")
+        vol = mesh.cell_volumes()
+        check(abs(float(vol.sum()) - 1.0) < 1e-9, f"单胞体积应为 1, 实际 {vol.sum()}")
+        check(mesh.face_centres().shape == (6, 3), "面心计算异常")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_fields() -> None:
     section("边界条件推荐")
     bc, params = fields.recommend_bc("velocity", "U", "inlet", "patch")
@@ -203,7 +293,15 @@ def test_render_header() -> None:
 
 def main() -> int:
     print(f"案例目录: {CASE.resolve()}")
-    for fn in (test_dictfile, test_polymesh, test_binary_mesh, test_fields, test_case_roundtrip, test_render_header):
+    for fn in (
+        test_dictfile,
+        test_polymesh,
+        test_binary_mesh,
+        test_exporter_compat,
+        test_fields,
+        test_case_roundtrip,
+        test_render_header,
+    ):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

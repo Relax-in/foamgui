@@ -173,9 +173,14 @@ class SolverTab(QtWidgets.QWidget):
         d = self.case.control_dict() if self.case else FoamDict()
         self._cd = d
         cb = self.changed.emit
-        add_atom_row(f, d, "solver", "求解器 solver", "choice",
+        # OpenFOAM 10 之前叫 application, 之后叫 solver; 有的前处理工具导出的
+        # 还是 application, 这里认哪个就用哪个, 不要凭空多写一条。
+        solver_key = "solver"
+        if "solver" not in d and "application" in d:
+            solver_key = "application"
+        add_atom_row(f, d, solver_key, "求解器 solver/application", "choice",
                      SOLVERS_INCOMPRESSIBLE + SOLVERS_COMPRESSIBLE, "incompressibleFluid",
-                     "OpenFOAM 13 用 foamRun + 模块名, 例如 incompressibleFluid", cb)
+                     "OpenFOAM 13 用 foamRun + 模块名(写 solver); 老案例可能是 application", cb)
         add_atom_row(f, d, "startFrom", "startFrom", "choice",
                      ["startTime", "latestTime", "firstTime"], "startTime", "", cb)
         add_atom_row(f, d, "startTime", "startTime", "text", None, "0", "", cb)

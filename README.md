@@ -127,6 +127,8 @@ rm -rf vendor/
   * `inlet`/`outlet`/`farfield` → `U: freestreamVelocity $internalField`、
     `p: freestreamPressure $internalField`、湍流场 `freestream $internalField`
   * 名字里带 `symmetry` → `symmetry`
+  * 名字优先于类型：有的工具（如 ANSA）把补片全导成 `type wall`，但名字还叫 `Block.inlet`／
+    `Block.outlet`，这时按名字判断，`Sphere.Sphere_Surface`、`Block.Block_Surface` 之类仍判为壁面
 * **同步网格补片**：换网格后新出现的补片，一键补进所有场。
 
 > 目录里没有列出的"冷门"边界条件参数不会被丢掉：它们会以"其他参数（原样保留）"的形式出现在表单里。
@@ -188,6 +190,12 @@ GUI 只修改它关心的条目，写盘时再整棵树序列化回文本。好�
 
 * ASCII 的 `faces` 同时支持经典的 `4(1 2 3 4)` 与 OpenFOAM 13 二进制里的紧凑写法（偏移数组 + 展平标签）；
 * binary 文件按"ASCII 个数 + `(` + 原始二进制 + `)`"的格式读取，标签宽度（int32/int64）自动嗅探；
+* **兼容第三方前处理工具导出的网格**（已在 ANSA 25 导出的二进制多面体网格上验证）。这类文件有两处
+  和 OpenFOAM 自带工具不一样：
+  1. 文件头用的是 `/*---*/` 装饰栏，**没有** `// * * * * //` 分隔行，`FoamFile` 之后还会多几行注释 ——
+     解析时优先找标准分隔行，找不到就按 `FoamFile { ... }` 字典本身定位正文，并跳过注释；
+  2. `neighbour` 按"每个面一项"写，边界面用 `-1` 占位（标准 OpenFOAM 只写内部面）—— 读取后会自动
+     按第一个负值截断，并用 `boundary` 文件里第一个补片的 `startFace` 交叉校验内部面数；
 * 从 `owner/neighbour` 建立"单元 → 面"和"单元 → 点"的 CSR 索引；
 * 单元体积用散度定理向量化计算（已和包围盒体积、以及 OpenFOAM 自己的结果核对过）。
 
@@ -261,9 +269,9 @@ docs/                         # 文档图片
 ## 6. 验证
 
 ```bash
-# 1) 单元测试：字典解析/网格读取/二进制网格/BC 推荐/案例读写
+# 1) 单元测试：字典解析/网格读取/二进制网格/第三方导出格式/BC 推荐/案例读写
 python -m foamgui.tests.test_foam airFoil2D
-#    -> 通过 50 项检查, 失败 0 项
+#    -> 通过 61 项检查, 失败 0 项
 
 # 2) 离屏 GUI 冒烟测试：打开 airFoil2D、切换每个页签、截图、试写字典
 QT_QPA_PLATFORM=offscreen FOAMGUI_SKIP_VTK_WIDGET=1 python -m foamgui.tests.smoke_gui airFoil2D _scratch/gui
@@ -275,10 +283,16 @@ DISPLAY=:0 python -m foamgui.tests.interaction_gui airFoil2D
 # 4) 离屏渲染网格图（软件 OpenGL）
 LIBGL_ALWAYS_SOFTWARE=1 python -m foamgui.tests.render_preview airFoil2D _scratch
 
-# 5) 端到端：用推荐 BC 重新生成整套字典，再用 OpenFOAM 13 真跑
+# 5) 端到端：用推荐 BC 重新生成整套字典，checkMesh 校验，可用则再用 OpenFOAM 13 真跑
 python -m foamgui.tests.e2e_openfoam airFoil2D
-#    -> foamDictionary 校验全部通过; foamRun 返回码 0, 生成 5/ 结果目录
+#    -> foamDictionary 校验全部通过; checkMesh 返回码 0; foamRun 返回码 0, 生成 5/ 结果目录
+
+# 6) 只有网格的案例(例如 ANSA 导出的 111): 同样能验证, 只是跳过求解器
+python -m foamgui.tests.e2e_openfoam 111
+#    -> checkMesh 返回码 0, Mesh OK.; 求解器是 UserSolver 占位, 跳过 foamRun
 ```
+
+上面 2)~6) 这些测试都是**按案例自适应的**（补片名、场名都从案例里现取），所以换任何算例都能直接跑。
 
 第 5 项在 airFoil2D 上的实际输出（节选）：
 
@@ -328,4 +342,6 @@ git clone .backup/foamgui.git /tmp/foamgui-check
 * **BC 目录是常见子集**：特殊求解器的专属边界条件没有全部收录，但可以用"其他参数（原样保留）"手工填；
 * **`0.orig`**：会优先读 `controlDict` 的 `startTime`，其次读 `0/`，最后才是 `0.orig`；
 * **GUI 启动的环境依赖**：见 2.1 节，Qt 6.5+ 需要 `libxcb-cursor0`，项目已带兜底副本；
+* **第三方工具导出的网格**已兼容（ANSA 风格的文件头与 `-1` 占位 `neighbour`），但这类工具常把
+  补片类型全写成 `wall`，实际用途要靠名字判断（工具会按名字推荐边界条件，仍需人工确认）；
 * **二进制网格**已支持并测试，但只覆盖了 OpenFOAM 13 平台默认的 int32/float64 组合（标签宽度会自动嗅探）。
