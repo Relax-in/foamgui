@@ -40,17 +40,8 @@ LAPLACIAN_SCHEMES = [
 ]
 INTERPOLATION_SCHEMES = ["linear", "linearUpwind grad(U)", "cubic", "vanLeer", "limitedLinear 1"]
 SNGRAD_SCHEMES = ["corrected", "uncorrected", "bounded corrected", "limited corrected 0.5"]
-RAS_MODELS = [
-    "SpalartAllmaras",
-    "kEpsilon",
-    "kOmega",
-    "kOmegaSST",
-    "realizableKE",
-    "LaunderSharmaKE",
-    "kkLOmega",
-    "v2f",
-]
-LES_MODELS = ["Smagorinsky", "kEqn", "WALE", "dynamicKEqn", "SpalartAllmarasDES", "kOmegaSSTDES"]
+RAS_MODELS = fields_mod.RAS_MODELS
+LES_MODELS = fields_mod.LES_MODELS
 
 
 class SolverTab(QtWidgets.QWidget):
@@ -194,10 +185,23 @@ class SolverTab(QtWidgets.QWidget):
         legacy = None
         if "solver" not in d and "application" in d:
             legacy = dictfile.get_atom(d, "application", "") or ""
-        add_atom_row(f, d, "solver", "求解器 solver", "choice",
-                     SOLVERS_INCOMPRESSIBLE + SOLVERS_COMPRESSIBLE,
-                     legacy or "incompressibleFluid",
-                     "OpenFOAM 13 用 foamRun + 模块名, 必须写成 solver incompressibleFluid;", cb)
+        solver_widget = add_atom_row(
+            f, d, "solver", "求解器 solver", "choice",
+            SOLVERS_INCOMPRESSIBLE + SOLVERS_COMPRESSIBLE,
+            legacy or "incompressibleFluid",
+            "OpenFOAM 13 用 foamRun + 模块名, 必须写成 solver incompressibleFluid;", cb)
+
+        def _tidy_solver(*_a) -> None:
+            """选了求解器之后: 清掉老式 application, 并把 solver 放到文件开头。"""
+            if "application" in d:
+                del d["application"]
+                self.statusMessage.emit(
+                    "已用 solver 取代老式的 application 条目(OpenFOAM 13 只用 solver)"
+                )
+            d.move_to_front("solver")
+
+        if legacy:
+            solver_widget.currentTextChanged.connect(_tidy_solver)
         if legacy:
             hint = QtWidgets.QLabel(
                 f"⚠ 该案例用的是老式写法 <code>application {legacy};</code>,"

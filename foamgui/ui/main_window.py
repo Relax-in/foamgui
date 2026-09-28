@@ -77,6 +77,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.patch_panel.patchVisibilityChanged.connect(self.view_panel.set_patch_visible)
         self.patch_panel.patchColorChanged.connect(self.view_panel.set_patch_color)
         self.patch_panel.patchRenameRequested.connect(self._rename_patch)
+        self.patch_panel.patchTypeChangeRequested.connect(self._change_patch_type)
         self.patch_panel.volumeColorToggled.connect(self.view_panel.set_volume_color)
         self.bc_tab.patchActivated.connect(self._on_patch_selected)
 
@@ -103,6 +104,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_message(f"已选中补片: {name}")
         finally:
             self._syncing_patch = False
+
+    def _change_patch_type(self, name: str, new_type: str) -> None:
+        """改补片的网格类型(会写进 polyMesh/boundary), 之后要重刷边界条件候选。"""
+        if self.case is None:
+            return
+        try:
+            affected = self.case.set_patch_type(name, new_type)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "修改失败", str(exc))
+            self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+            return
+        # 约束型补片(empty/wedge/symmetry)只能用同名的边界条件:
+        # 网格类型改了以后, 该补片上原来的边界条件就失效了, 这里提示并同步
+        fixed: list[str] = []
+        if new_type in ("empty", "wedge", "symmetry", "symmetryPlane"):
+            bad = [
+                ff for ff in self.case.fields.values()
+                if ff.patch_type(name) and ff.patch_type(name) != new_type
+            ]
+            if bad:
+                detail = "\n".join(f"  · {ff.name}: {ff.patch_type(name)}" for ff in bad)
+                ok = QtWidgets.QMessageBox.question(
+                    self,
+                    "同步边界条件",
+                    f"补片 {name} 现在是 {new_type} 类型, 它上面的这些边界条件已经失效:\n"
+                    f"{detail}\n\n是否自动把它们改成 {new_type} ?",
+                )
+                if ok == QtWidgets.QMessageBox.StandardButton.Yes:
+                    for ff in bad:
+                        d = ff.patch_dict(name)
+                        for k in list(d.keys()):
+                            del d[k]
+                        d.set("type", new_type)
+                        fixed.append(ff.name)
+        self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+        self.patch_panel.select(name, emit=False)
+        self.bc_tab.set_case(self.case)
+        self.bc_tab.select_patch(name)
+        self.output_tab.refresh(force=True)
+        self._on_changed()
+        msg = f"补片 {name} 的网格类型已改为 {new_type}"
+        if fixed:
+            msg += f"; 已把这些场的边界条件同步为 {new_type}: {'、'.join(fixed)}"
+        elif affected:
+            msg += f"; 受影响的场: {'、'.join(affected)}(可在『边界条件』页检查)"
+        msg += "。写出时会一并更新 constant/polyMesh/boundary"
+        self.show_message(msg)
 
     def _rename_patch(self, old: str, new: str) -> None:
         if self.case is None:

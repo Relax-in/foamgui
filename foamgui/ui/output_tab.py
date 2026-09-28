@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtWidgets
 
-from ..foam import ofenv
+from ..foam import ofenv, validate
 from .widgets import mono_font
 
 __all__ = ["OutputTab"]
@@ -22,10 +22,24 @@ class OutputTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.case = None
         self.files: dict[str, str] = {}
+        self.issues: list = []
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
+
+        check = QtWidgets.QHBoxLayout()
+        self.lbl_check = QtWidgets.QLabel("尚未自检")
+        self.lbl_check.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        check.addWidget(self.lbl_check, 1)
+        self.btn_check = QtWidgets.QPushButton("查看自检结果…")
+        self.btn_check.setToolTip(
+            "写出之前检查一遍设置: 补片类型与边界条件是否匹配、湍流模型与场是否齐全、\n"
+            "压力参考、controlDict 的 solver 等 —— 这些都是 OpenFOAM 一跑就报错的点"
+        )
+        self.btn_check.clicked.connect(self._show_issues)
+        check.addWidget(self.btn_check)
+        lay.addLayout(check)
 
         top = QtWidgets.QHBoxLayout()
         self.lbl_target = QtWidgets.QLabel("目标目录: -")
@@ -74,6 +88,38 @@ class OutputTab(QtWidgets.QWidget):
         self.lbl_target.setText(f"目标目录: {case.root if case else '-'}")
         self.refresh(force=True)
 
+    # ------------------------------------------------------------------
+    def _refresh_issues(self) -> None:
+        self.issues = validate.check_case(self.case) if self.case is not None else []
+        errors = sum(1 for i in self.issues if i.level == "error")
+        warns = len(self.issues) - errors
+        if not self.issues:
+            self.lbl_check.setText("自检: 未发现问题 ✓")
+        else:
+            self.lbl_check.setText(
+                f"自检: <b>{errors} 个错误</b>, {warns} 个警告 —— "
+                + (self.issues[0].where + ": " + self.issues[0].message)
+            )
+        self.btn_check.setEnabled(bool(self.issues))
+
+    def _show_issues(self) -> None:
+        if not self.issues:
+            QtWidgets.QMessageBox.information(self, "自检结果", "未发现问题。")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("案例自检结果")
+        dlg.resize(860, 520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        text = "\n\n".join(i.text() for i in self.issues)
+        te = QtWidgets.QPlainTextEdit(text)
+        te.setReadOnly(True)
+        te.setFont(mono_font())
+        v.addWidget(te)
+        b = QtWidgets.QPushButton("关闭")
+        b.clicked.connect(dlg.accept)
+        v.addWidget(b)
+        dlg.exec()
+
     def mark_stale(self) -> None:
         self.lbl_summary.setText("设置已修改, 点“刷新预览”查看最新的字典内容")
 
@@ -84,6 +130,7 @@ class OutputTab(QtWidgets.QWidget):
             self.text.setPlainText("")
             return
         current = self.list.currentItem().text() if self.list.currentItem() else None
+        self._refresh_issues()
         self.files = self.case.render_all()
         self.list.blockSignals(True)
         self.list.clear()
@@ -106,9 +153,11 @@ class OutputTab(QtWidgets.QWidget):
                 item.setFont(f)
             self.list.addItem(item)
         self.list.blockSignals(False)
-        self.lbl_summary.setText(
-            f"共 {len(self.files)} 个文件, 其中 {changed} 个与磁盘上不同(带 * 号)"
-        )
+        summary = f"共 {len(self.files)} 个文件, 其中 {changed} 个与磁盘上不同(带 * 号)"
+        errors = sum(1 for i in self.issues if i.level == "error")
+        if errors:
+            summary += f"   ⚠ 自检发现 {errors} 个错误(点上面的“查看自检结果”)"
+        self.lbl_summary.setText(summary)
         # 恢复选中
         target = 0
         for i in range(self.list.count()):
@@ -132,11 +181,20 @@ class OutputTab(QtWidgets.QWidget):
         if self.case is None:
             return
         n = len(self.files)
+        self._refresh_issues()
+        errors = [i for i in self.issues if i.level == "error"]
+        extra = ""
+        if errors:
+            extra = (
+                "\n\n⚠ 自检发现 " + str(len(errors)) + " 个错误(OpenFOAM 很可能跑不起来):\n"
+                + "\n".join("  · " + i.where + ": " + i.message for i in errors[:5])
+                + ("\n  ..." if len(errors) > 5 else "")
+            )
         ok = QtWidgets.QMessageBox.question(
             self,
             "确认写入",
             f"将把 {n} 个字典文件写入:\n{self.case.root}\n\n"
-            "原有文件会先备份到 foamgui_backup/<时间戳>/ 下。是否继续?",
+            "原有文件会先备份到 foamgui_backup/<时间戳>/ 下。" + extra + "\n\n是否继续?",
         )
         if ok != QtWidgets.QMessageBox.StandardButton.Yes:
             return

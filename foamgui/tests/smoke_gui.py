@@ -201,8 +201,10 @@ def main(argv: list[str]) -> int:
     assert _df.get_atom(cd, "solver", "") == "incompressibleFluid", \
         f"改动后应当写入 solver, 实际 solver={_df.get_atom(cd, 'solver')!r}"
     assert "solver incompressibleFluid;" in text, "写出的 controlDict 里没有 solver incompressibleFluid;"
-    assert _df.get_atom(cd, "application", "") == "UserSolver", "老式 application 条目不应被改动"
-    print("[3j] 求解器始终写入 solver(老式 application 案例也正确)", flush=True)
+    assert "application" not in cd.keys(), "选了求解器后应当清掉老式 application 条目"
+    assert text.index("solver incompressibleFluid;") < text.index("startFrom"), \
+        "solver 应当写在 controlDict 靠前的位置"
+    print("[3j] 求解器写入 solver, 并清掉老式 application、放到文件开头", flush=True)
 
     # 显式"把当前显示的值写入字典": 应当补齐 pRefCell/pRefValue 这类条目
     before_keys = [k for k, _ in _df.get_dict(case.render_all() and case.get("system", "fvSolution"), "SIMPLE").items] \
@@ -213,6 +215,23 @@ def main(argv: list[str]) -> int:
     assert sim is not None and "pRefCell" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefCell"
     assert "pRefValue" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefValue"
     print(f"[3k] 『把当前显示的值写入字典』正常(SIMPLE 现在有 {sim.keys()})", flush=True)
+
+    # 自检 + 修改补片网格类型
+    from foamgui.foam import validate as _val
+
+    win.output_tab.refresh(force=True)
+    app.processEvents()
+    n_before = len(win.output_tab.issues)
+    print(f"[3l] 自检在界面上可用(当前 {n_before} 条): {win.output_tab.lbl_check.text()[:60]}", flush=True)
+    if p2:
+        win._change_patch_type(p2, "symmetry")
+        app.processEvents()
+        assert win.case.mesh.patch_by_name(p2).type == "symmetry", "补片网格类型没改掉"
+        avail = [t.name for t in __import__("foamgui.foam.fields", fromlist=["x"]).bc_types_for(
+            case.fields[field0].category, "symmetry")]
+        assert avail == ["symmetry"], f"symmetry 补片的候选应为 symmetry, 实际 {avail}"
+        assert win.case.render_all().get("constant/polyMesh/boundary"), "改类型后应生成 boundary 文件"
+        print(f"[3m] 补片网格类型 {p2} -> symmetry 正常(边界条件候选已跟着变)", flush=True)
 
     # 写出到临时目录
     written, _ = case.write(out_dir=out_dir, backup=False)

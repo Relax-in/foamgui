@@ -333,6 +333,34 @@ class FoamCase:
             )
         return out
 
+    def set_patch_type(self, name: str, new_type: str) -> list[str]:
+        """修改补片的**网格类型**(patch/wall/empty/wedge/symmetry...)。
+
+        会同时更新 ``constant/polyMesh/boundary`` 里该补片的 ``type``, 因此写出时
+        会一并更新 boundary 文件。返回该补片上已有边界条件的场名(它们可能需要
+        跟着改, 例如 wall 改成 symmetry 之后原来的 noSlip 就不合法了)。
+        """
+        if self.mesh is None:
+            raise ValueError("尚未读取网格")
+        patch = self.mesh.patch_by_name(name)
+        if patch is None:
+            raise ValueError(f"找不到补片 {name}")
+        new_type = (new_type or "").strip()
+        if not new_type or new_type == patch.type:
+            return []
+        patch.type = new_type
+        body = self.mesh.boundary_body
+        if body is not None and body.items:
+            lst = body.items[0][1]
+            for i, item in enumerate(lst):
+                if isinstance(item, str) and item == name and i + 1 < len(lst):
+                    d = lst[i + 1]
+                    if isinstance(d, FoamDict):
+                        d.set("type", new_type)
+                    break
+        self.mesh_modified = True
+        return [ff.name for ff in self.fields.values() if ff.patch_type(name)]
+
     # -- 默认字典 -----------------------------------------------------------
     def _ensure_system_defaults(self) -> None:
         """缺少 system/constant 文件时给出 OpenFOAM 13 的合理默认值。"""

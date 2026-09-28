@@ -105,6 +105,15 @@ class FoamDict:
                 return
         self.items.append((key, value))
 
+    def move_to_front(self, key: str) -> None:
+        """把某个条目挪到最前面(OpenFOAM 习惯把 solver 写在 controlDict 开头)。"""
+        for i, (k, v) in enumerate(self.items):
+            if k == key:
+                if i:
+                    self.items.pop(i)
+                    self.items.insert(0, (key, v))
+                return
+
     def pop(self, key: str, default: Any = None) -> Any:
         v = self.get(key, _MISSING)
         if v is _MISSING:

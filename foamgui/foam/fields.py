@@ -17,6 +17,10 @@ from . import dictfile
 from .dictfile import Compound, FoamDict, FoamList
 
 __all__ = [
+    "RAS_MODELS",
+    "_CONSTRAINT_BC_NAMES",
+    "_CONSTRAINT_PATCH_BCS",
+    "LES_MODELS",
     "FieldSpec",
     "ParamSpec",
     "BCType",
@@ -65,6 +69,16 @@ FIELD_CATALOG: dict[str, FieldSpec] = {
     "alphat": FieldSpec("alphat", "scalar", "volScalarField", "[1 -1 -1 0 0 0 0]", "turbulence", "湍流热扩散率"),
     "T": FieldSpec("T", "scalar", "volScalarField", "[0 0 0 1 0 0 0]", "scalar", "温度 T"),
 }
+
+#: 常见 RAS / LES 模型名(界面下拉 + 自检都要用)
+RAS_MODELS = [
+    "SpalartAllmaras", "kEpsilon", "kOmega", "kOmegaSST", "realizableKE",
+    "LaunderSharmaKE", "kkLOmega", "v2f", "kOmegaSSTLM", "kOmegaSSTSAS", "qZeta",
+]
+LES_MODELS = [
+    "Smagorinsky", "kEqn", "WALE", "dynamicKEqn", "SpalartAllmarasDES",
+    "kOmegaSSTDES", "dynamicLagrangian", "DeardorffDiffStress",
+]
 
 # 湍流模型 -> 需要哪些场(用于"添加场"提示)
 TURBULENCE_FIELDS = {
@@ -237,16 +251,42 @@ _CATALOG: dict[str, list[BCType]] = {
 }
 
 
+#: 网格里的"约束型"补片类型 -> 只能用的边界条件类型。
+#  OpenFOAM 会检查 "patch type 'x' not constraint type 'y'": 约束型边界
+#  (empty/wedge/symmetry/...) 只能加在网格里同样是该类型的补片上。
+_CONSTRAINT_PATCH_BCS: dict[str, set[str]] = {
+    "empty": {"empty"},
+    "wedge": {"wedge"},
+    "symmetry": {"symmetry"},
+    "symmetryPlane": {"symmetryPlane"},
+    "cyclic": {"cyclic"},
+    "cyclicAMI": {"cyclicAMI"},
+    "nonConformalCyclic": {"nonConformalCyclic"},
+    "processor": {"processor"},
+    "processorCyclic": {"processorCyclic"},
+}
+#: 所有约束型边界条件(不能用在 wall/patch 上)
+_CONSTRAINT_BC_NAMES = {
+    "empty", "wedge", "symmetry", "symmetryPlane", "cyclic", "cyclicAMI",
+    "nonConformalCyclic", "processor", "processorCyclic", "jumpCyclic",
+}
+
+
 def bc_types_for(category: str, patch_type: str = "patch") -> list[BCType]:
-    """按补片类型过滤可用的 BC 类型。"""
+    """按补片的**网格类型**过滤可用的边界条件类型。
+
+    规则(和 OpenFOAM 的约束一致):
+    * 网格是 empty/wedge/symmetry/cyclic 这类约束型补片 -> 只能用同名的约束型边界;
+    * 网格是 wall/patch -> **不能**用 empty/wedge/symmetry 这些约束型边界
+      (否则求解器会报 "patch type 'wall' not constraint type 'symmetry'")。
+    """
     types = list(_CATALOG.get(category, _SCALAR_TYPES))
-    if patch_type in ("empty", "wedge"):
-        keep = {"empty", "wedge", "symmetry", "zeroGradient", "fixedValue", "calculated"}
-        return [t for t in types if t.name in keep]
-    if patch_type == "symmetry":
-        return [t for t in types if t.name in ("symmetry", "zeroGradient", "fixedValue", "slip")]
+    allowed = _CONSTRAINT_PATCH_BCS.get(patch_type)
+    if allowed is not None:
+        return [t for t in types if t.name in allowed]
+    # 非约束型补片: 先把所有约束型边界排除掉
+    types = [t for t in types if t.name not in _CONSTRAINT_BC_NAMES]
     if patch_type == "wall":
-        # 壁面: 保留壁面专用 + 通用
         return [t for t in types if t.patches in ("all", "wall")] + [
             t for t in types if t.patches == "nonwall" and t.name in ("fixedFluxPressure",)
         ]

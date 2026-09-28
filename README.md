@@ -106,7 +106,14 @@ rm -rf vendor/
 
 ### 3.3 补片模型树与重命名
 
-* 每行一个补片：显示勾选框、补片名、类型、面数、颜色（点色块改色）；
+* 每行一个补片：显示勾选框、补片名、**网格类型**（下拉框，可直接改）、面数、颜色（点色块改色）；
+  * **网格类型**（写在 `constant/polyMesh/boundary` 里的 `type`）决定了哪些边界条件能用：
+    `empty`/`wedge`/`symmetry`/`cyclic` 这些**约束型**补片只能加同名的约束型边界；
+    在 `wall`/`patch` 补片上用 `symmetry` 会被 OpenFOAM 拒绝
+    （`patch type 'wall' not constraint type 'symmetry'`）。
+    从 ANSA 之类工具导入的网格常常把补片全导成 `wall`，这时就可以在这里改对；
+  * 改成约束型（empty/wedge/symmetry）后，界面会提示"该补片上原有的边界条件已失效"，
+    并可以一键把它们同步成新类型（例如 `p` 的 `zeroGradient` → `symmetry`）；
 * **重命名**：双击"补片"列的名字直接改，或选中后点 **重命名…**；
   改名会同时写到 `constant/polyMesh/boundary` 与**所有场**的 `boundaryField`，
   写出字典时一并更新（已用 `checkMesh` + `foamRun` 验证过改名后算例仍能正常求解）；
@@ -174,7 +181,15 @@ rm -rf vendor/
 
 ![生成字典](docs/gui_main_output.jpg)
 
-* 左侧列出将要写出的文件，带 `*` 的表示与磁盘上现有内容不同；补片改过名时，
+* 顶部有**案例自检**：写出之前先把"OpenFOAM 一跑就报错"的设置问题列出来，例如
+  * 补片网格类型与边界条件不匹配（`symmetry` 加在 `wall` 上）；
+  * 湍流模型选了 `kOmegaSST` 却没有 `k`/`omega` 场，或写成 `RAS { model laminar; }`；
+  * 封闭域（压力边界全是零梯度/对称）却没有 `pRefCell`/`pRefValue`；
+  * `controlDict` 里只有老式 `application` 而没有 `solver`；
+  * `fvSolution/solvers` 缺少某个场的设置。
+
+  点「查看自检结果…」看详情（每条都告诉你到界面上哪里改）；写入时若有错误会先提醒。
+* 左侧列出将要写出的文件，带 `*` 的表示与磁盘上现有内容不同；补片改过名或改过类型时，
   `constant/polyMesh/boundary` 也会出现在列表里；
 * 右侧是文件的**完整文本预览**（所见即所写）；
 * 三个按钮：
@@ -354,7 +369,9 @@ git clone .backup/foamgui.git /tmp/foamgui-check
   `snappyHexMesh` 的 `meshQualityDict` 等按名字写死的设置，需要自己检查；
 * **BC 目录是常见子集**：特殊求解器的专属边界条件没有全部收录，但可以用"其他参数（原样保留）"手工填；
 * **`0.orig`**：会优先读 `controlDict` 的 `startTime`，其次读 `0/`，最后才是 `0.orig`；
-* **案例能不能跑取决于物理设置**：工具只保证网格/字典**格式正确**。像只导出过网格的算例
+* **案例能不能跑取决于物理设置**：工具的**自检**能覆盖上面列出的常见硬错误（补片类型/边界条件、
+  湍流模型与场、压力参考、solver 键），但物理上是否合理（湍流模型选型、边界条件取值、时间步等）
+  仍需自己判断。像只导出过网格的算例
   （例如 ANSA 导出的 `111`），还需要自己确认求解器模块、湍流模型、压力参考（`pRefCell`）、
   边界条件等 —— 缺少时 OpenFOAM 会给出明确报错，按报错在界面上补即可；
 * **GUI 启动的环境依赖**：见 2.1 节，Qt 6.5+ 需要 `libxcb-cursor0`，项目已带兜底副本；

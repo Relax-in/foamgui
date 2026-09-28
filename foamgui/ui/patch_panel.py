@@ -16,6 +16,11 @@ from .widgets import ColorButton
 
 __all__ = ["PatchPanel"]
 
+#: 可以在界面里选择的补片网格类型(常用的几种)
+PATCH_MESH_TYPES = [
+    "patch", "wall", "empty", "wedge", "symmetry", "symmetryPlane", "cyclic", "cyclicAMI",
+]
+
 
 class _NameOnlyDelegate(QtWidgets.QStyledItemDelegate):
     """只允许编辑"补片"列(第 1 列)。"""
@@ -31,6 +36,7 @@ class PatchPanel(QtWidgets.QWidget):
     patchVisibilityChanged = QtCore.pyqtSignal(str, bool)
     patchColorChanged = QtCore.pyqtSignal(str, tuple)
     patchRenameRequested = QtCore.pyqtSignal(str, str)
+    patchTypeChangeRequested = QtCore.pyqtSignal(str, str)
     volumeColorToggled = QtCore.pyqtSignal(bool)
     statusMessage = QtCore.pyqtSignal(str)
 
@@ -95,8 +101,8 @@ class PatchPanel(QtWidgets.QWidget):
         lay.addLayout(row)
 
         hint = QtWidgets.QLabel(
-            "提示: 在三维窗口里单击补片表面即可选中; 双击名字可改名(会同步写入 "
-            "polyMesh/boundary 与各场的 boundaryField)"
+            "提示: 在三维窗口里单击补片表面即可选中; 双击名字可改名; "
+            "“类型”列可以直接改补片的网格类型(会同步写入 polyMesh/boundary)"
         )
         hint.setWordWrap(True)
         hint.setEnabled(False)
@@ -120,7 +126,7 @@ class PatchPanel(QtWidgets.QWidget):
             f"{mesh.n_cells:,} 单元 / {mesh.n_faces:,} 面 / {len(mesh.patches)} 个补片"
         )
         for patch in mesh.patches:
-            item = QtWidgets.QTreeWidgetItem(["", patch.name, patch.type, str(patch.n_faces), ""])
+            item = QtWidgets.QTreeWidgetItem(["", patch.name, "", str(patch.n_faces), ""])
             item.setFlags(
                 item.flags()
                 | QtCore.Qt.ItemFlag.ItemIsUserCheckable
@@ -137,7 +143,21 @@ class PatchPanel(QtWidgets.QWidget):
             btn.colorChanged.connect(
                 lambda rgb, name=patch.name: self.patchColorChanged.emit(name, tuple(rgb))
             )
+            combo = QtWidgets.QComboBox()
+            combo.addItems(PATCH_MESH_TYPES)
+            if patch.type not in PATCH_MESH_TYPES:
+                combo.addItem(patch.type)
+            combo.setCurrentText(patch.type)
+            combo.setToolTip(
+                "补片的**网格类型**(写在 constant/polyMesh/boundary 里)。\n"
+                "边界条件类型必须与之匹配: 例如 empty/wedge/symmetry 只能用在\n"
+                "同样类型的补片上; 从 ANSA 等工具导入的网格常常全是 wall。"
+            )
+            combo.currentTextChanged.connect(
+                lambda text, name=patch.name: self.patchTypeChangeRequested.emit(name, text)
+            )
             self.tree.addTopLevelItem(item)
+            self.tree.setItemWidget(item, 2, combo)
             self.tree.setItemWidget(item, 4, self._wrap(btn))
             self._items[patch.name] = item
         self._loading = False
