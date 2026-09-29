@@ -26,6 +26,15 @@ ensure_qt_deps()
 from PyQt6 import QtCore, QtTest, QtWidgets  # noqa: E402
 
 
+def _pump(app, ms: int = 250) -> None:
+    """跑一会儿事件循环, 让被延后处理的请求(以及重绘)都执行完。"""
+    from PyQt6 import QtCore
+
+    loop = QtCore.QEventLoop()
+    QtCore.QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
 def _silence_dialogs() -> None:
     """把模态弹窗改成自动应答, 否则自动化测试会被没人点的对话框卡住。"""
     from PyQt6 import QtWidgets
@@ -225,13 +234,64 @@ def main(argv: list[str]) -> int:
             fail(f"改名后拾取失败: {state['hits']}")
         else:
             print(f"    改名后仍能正确拾取 {new}", flush=True)
-        finish()
+        test_patch_type_and_crash_guard()
 
     def finish() -> None:
         win._dirty = False
         win.close()
         app.quit()
         print("[OK] 交互测试通过" if state["result"] == 0 else "[失败] 交互测试未通过", flush=True)
+
+    def test_patch_type_and_crash_guard() -> None:
+        """用真实下拉弹窗改补片网格类型(用户报的闪退路径), 并验证异常不会导致闪退。"""
+        panel = win.patch_panel
+        # 注意: 第 4 步改过名, 模型树已重建, 所以取"当前选中的补片"
+        name = panel.selected_patch() or state.get("picked")
+        if not name:
+            return finish()
+        print("[5] 通过模型树的下拉弹窗修改补片网格类型", flush=True)
+        item = panel._items.get(name)
+        combo = panel.tree.itemWidget(item, 2) if item is not None else None
+        if combo is None:
+            fail("模型树里找不到网格类型下拉框")
+            return finish()
+        old = combo.currentText()
+        target_text = "symmetry" if old != "symmetry" else "wall"
+        combo.showPopup()
+        app.processEvents()
+        view = combo.view()
+        model = combo.model()
+        rows = [i for i in range(model.rowCount()) if model.index(i, 0).data() == target_text]
+        if not rows:
+            combo.hidePopup()
+            fail(f"下拉框里没有 {target_text}")
+            return finish()
+        QtTest.QTest.mouseClick(
+            view.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier, view.visualRect(model.index(rows[0], 0)).center(),
+        )
+        _pump(app, 400)          # 等待"延后一轮"的请求 + 可能的确认框
+        got = win.case.mesh.patch_by_name(name)
+        if got is None or got.type != target_text:
+            fail(f"下拉框改了类型但没生效(当前 {got.type if got else None})")
+        else:
+            print(f"    {name}: {old} -> {got.type} 生效", flush=True)
+
+        # 异常兜底: 即使内部出错, 也不能把整个程序带走(闪退)
+        real = win.case.set_patch_type
+
+        def boom(*_a, **_k):
+            raise RuntimeError("测试用异常")
+
+        win.case.set_patch_type = boom
+        win._change_patch_type(name, "patch")
+        _pump(app, 300)
+        win.case.set_patch_type = real
+        if not win.isVisible():
+            fail("内部出错后界面没了(闪退)")
+        else:
+            print("    内部出错后界面仍在, 状态栏: " + win.lbl_status.text()[:40], flush=True)
+        finish()
 
     QtCore.QTimer.singleShot(1200, start)
     QtCore.QTimer.singleShot(120000, app.quit)

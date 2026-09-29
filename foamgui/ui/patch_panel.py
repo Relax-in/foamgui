@@ -154,7 +154,7 @@ class PatchPanel(QtWidgets.QWidget):
                 "同样类型的补片上; 从 ANSA 等工具导入的网格常常全是 wall。"
             )
             combo.currentTextChanged.connect(
-                lambda text, name=patch.name: self.patchTypeChangeRequested.emit(name, text)
+                lambda text, name=patch.name: self._request_type_change(name, text)
             )
             self.tree.addTopLevelItem(item)
             self.tree.setItemWidget(item, 2, combo)
@@ -172,6 +172,21 @@ class PatchPanel(QtWidgets.QWidget):
         return holder
 
     # ------------------------------------------------------------------
+    def _request_type_change(self, name: str, new_type: str) -> None:
+        """把"改网格类型"的请求延后到事件循环下一轮。
+
+        这个信号来自表格里的下拉框; 如果直接在信号处理里让主窗口重建控件
+        (tree.clear()), 正在发信号的控件以及它还没关掉的弹窗会被一起销毁,
+        在部分环境下会直接闪退。延后一轮可以让弹窗先正常关闭。
+        """
+        QtCore.QTimer.singleShot(
+            0, lambda: self.patchTypeChangeRequested.emit(name, new_type)
+        )
+
+    def _request_rename(self, old: str, new: str) -> None:
+        """同理: 改名会重建模型树, 而此刻单元格编辑器可能还没提交完。"""
+        QtCore.QTimer.singleShot(0, lambda: self.patchRenameRequested.emit(old, new))
+
     def select(self, name: str, emit: bool = True) -> None:
         item = self._items.get(name)
         if item is None:
@@ -212,7 +227,7 @@ class PatchPanel(QtWidgets.QWidget):
         elif column == 1:
             new = item.text(1).strip()
             if new and new != name:
-                self.patchRenameRequested.emit(name, new)
+                self._request_rename(name, new)
 
     def _on_selection_changed(self) -> None:
         if self._loading:

@@ -10,6 +10,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from ..foam import dictfile, ofenv
 from ..foam.case import FoamCase
 from .bc_tab import BoundaryConditionsTab, InitialConditionsTab
+from .errors import install_excepthook
 from .output_tab import OutputTab
 from .patch_panel import PatchPanel
 from .solver_tab import SolverTab
@@ -81,6 +82,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.patch_panel.volumeColorToggled.connect(self.view_panel.set_volume_color)
         self.bc_tab.patchActivated.connect(self._on_patch_selected)
 
+        # 槽函数里的未捕获异常在 PyQt6 里默认会让程序直接 abort(表现为"闪退"),
+        # 这里换成弹提示 + 继续运行
+        install_excepthook()
+
         self._restore_geometry()
 
     # ------------------------------------------------------------------
@@ -106,14 +111,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._syncing_patch = False
 
     def _change_patch_type(self, name: str, new_type: str) -> None:
-        """改补片的网格类型(会写进 polyMesh/boundary), 之后要重刷边界条件候选。"""
+        """改补片的网格类型(会写进 polyMesh/boundary), 之后要重刷边界条件候选。
+
+        注意: 模型树里的下拉框发出请求时**已经延后了一轮**(见 PatchPanel.
+        _request_type_change), 所以这里可以放心地重建面板/弹确认框 —— 不会在
+        信号处理过程中把正在发信号的控件销毁掉。
+        """
         if self.case is None:
             return
+        try:
+            self._apply_patch_type_change_inner(name, new_type)
+        except Exception:  # noqa: BLE001 - 界面槽函数绝不能把异常抛回 Qt
+            import traceback
+
+            traceback.print_exc()
+            self.show_message("改补片类型时出错, 详情见终端输出(程序继续运行)")
+
+    def _apply_patch_type_change_inner(self, name: str, new_type: str) -> None:
         try:
             affected = self.case.set_patch_type(name, new_type)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "修改失败", str(exc))
-            self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+            self.show_message(f"改补片类型失败: {exc}")
+            if getattr(self.case, "mesh", None) is not None:
+                self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
             return
         # 约束型补片(empty/wedge/symmetry)只能用同名的边界条件:
         # 网格类型改了以后, 该补片上原来的边界条件就失效了, 这里提示并同步
@@ -138,7 +159,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             del d[k]
                         d.set("type", new_type)
                         fixed.append(ff.name)
-        self.patch_panel.set_mesh(self.case.mesh, self.view_panel.view.scene.patch_colors)
+        # 注意: 这里**不重建模型树** —— 信号就是那棵树里的下拉框发出的,
+        # 重建会把发信号的控件销毁掉; 下拉框本身已经显示新类型了。
         self.patch_panel.select(name, emit=False)
         self.bc_tab.set_case(self.case)
         self.bc_tab.select_patch(name)
@@ -153,6 +175,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_message(msg)
 
     def _rename_patch(self, old: str, new: str) -> None:
+        """补片改名(会同步网格 boundary 与各场的 boundaryField)。
+
+        模型树里的改名请求同样已在 PatchPanel._request_rename 里延后过一轮,
+        避免单元格编辑器还没提交就把控件树重建掉。
+        """
+        if self.case is None:
+            return
+        try:
+            self._apply_rename_patch_inner(old, new)
+        except Exception:  # noqa: BLE001
+            import traceback
+
+            traceback.print_exc()
+            self.show_message("补片改名时出错, 详情见终端输出(程序继续运行)")
+
+    def _apply_rename_patch_inner(self, old: str, new: str) -> None:
         if self.case is None:
             return
         try:
