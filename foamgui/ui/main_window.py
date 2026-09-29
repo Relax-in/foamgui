@@ -174,6 +174,15 @@ class MainWindow(QtWidgets.QMainWindow):
         msg += "。写出时会一并更新 constant/polyMesh/boundary"
         self.show_message(msg)
 
+    def _on_fields_changed(self) -> None:
+        """0/ 里新增了场: 刷新初始/边界条件页与字典预览。"""
+        if self.case is None:
+            return
+        self.ic_tab.set_case(self.case)
+        self.bc_tab.set_case(self.case)
+        self.output_tab.refresh(force=True)
+        self._on_changed()
+
     def _rename_patch(self, old: str, new: str) -> None:
         """补片改名(会同步网格 boundary 与各场的 boundaryField)。
 

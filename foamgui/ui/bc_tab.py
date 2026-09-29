@@ -162,8 +162,12 @@ class InitialConditionsTab(QtWidgets.QWidget):
             return
         self.case.add_field(name)
         self.case.sync_patches()
+        added = self.case.ensure_schemes_for_fields([name])
         self.refresh()
-        self.statusMessage.emit(f"已添加场 {name}")
+        msg = f"已添加场 {name}"
+        if added:
+            msg += "(并补上 " + "、".join(added) + ")"
+        self.statusMessage.emit(msg)
         self.changed.emit()
 
     def _remove_field(self) -> None:

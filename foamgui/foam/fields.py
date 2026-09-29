@@ -55,19 +55,25 @@ class FieldSpec:
     dimensions: str
     category: str  # 'velocity' | 'pressure' | 'turbulence' | 'scalar'
     description: str = ""
+    #: 新建这个场时的 internalField 默认值。
+    #  湍流场必须给非零值: k=0 或 omega=0 会让 kOmegaSST 之类的模型除零直接崩
+    internal: str = ""
 
 
 FIELD_CATALOG: dict[str, FieldSpec] = {
     "U": FieldSpec("U", "vector", "volVectorField", "[0 1 -1 0 0 0 0]", "velocity", "速度"),
     "p": FieldSpec("p", "scalar", "volScalarField", "[0 2 -2 0 0 0 0]", "pressure", "运动学压力 p/rho"),
     "p_rgh": FieldSpec("p_rgh", "scalar", "volScalarField", "[0 2 -2 0 0 0 0]", "pressure", "扣除静压的压力"),
-    "k": FieldSpec("k", "scalar", "volScalarField", "[0 2 -2 0 0 0 0]", "turbulence", "湍动能 k"),
-    "epsilon": FieldSpec("epsilon", "scalar", "volScalarField", "[0 2 -3 0 0 0 0]", "turbulence", "湍流耗散率 ε"),
-    "omega": FieldSpec("omega", "scalar", "volScalarField", "[0 0 -1 0 0 0 0]", "turbulence", "比耗散率 ω"),
-    "nut": FieldSpec("nut", "scalar", "volScalarField", "[0 2 -1 0 0 0 0]", "turbulence", "湍流运动粘度 nut"),
-    "nuTilda": FieldSpec("nuTilda", "scalar", "volScalarField", "[0 2 -1 0 0 0 0]", "turbulence", "SA 模型工作变量"),
-    "alphat": FieldSpec("alphat", "scalar", "volScalarField", "[1 -1 -1 0 0 0 0]", "turbulence", "湍流热扩散率"),
-    "T": FieldSpec("T", "scalar", "volScalarField", "[0 0 0 1 0 0 0]", "scalar", "温度 T"),
+    "k": FieldSpec("k", "scalar", "volScalarField", "[0 2 -2 0 0 0 0]", "turbulence", "湍动能 k", "0.1"),
+    "epsilon": FieldSpec("epsilon", "scalar", "volScalarField", "[0 2 -3 0 0 0 0]", "turbulence",
+                         "湍流耗散率 ε", "0.01"),
+    "omega": FieldSpec("omega", "scalar", "volScalarField", "[0 0 -1 0 0 0 0]", "turbulence", "比耗散率 ω", "1"),
+    "nut": FieldSpec("nut", "scalar", "volScalarField", "[0 2 -1 0 0 0 0]", "turbulence", "湍流运动粘度 nut", "0"),
+    "nuTilda": FieldSpec("nuTilda", "scalar", "volScalarField", "[0 2 -1 0 0 0 0]", "turbulence",
+                         "SA 模型工作变量", "0"),
+    "alphat": FieldSpec("alphat", "scalar", "volScalarField", "[1 -1 -1 0 0 0 0]", "turbulence",
+                        "湍流热扩散率", "0"),
+    "T": FieldSpec("T", "scalar", "volScalarField", "[0 0 0 1 0 0 0]", "scalar", "温度 T", "300"),
 }
 
 #: 常见 RAS / LES 模型名(界面下拉 + 自检都要用)
@@ -125,7 +131,10 @@ def make_field_dict(spec: FieldSpec, patches: list[str], locations: list[str] | 
     """新建一个场文件的内容(internalField + 各补片的占位 BC)。"""
     body = FoamDict()
     body.set("dimensions", dictfile.Dimensioned(spec.dimensions.strip("[]").split(), Compound([])))
-    default = ["0"] if spec.kind == "scalar" else ["0", "0", "0"]
+    if spec.internal:
+        default = spec.internal.split()
+    else:
+        default = ["0"] if spec.kind == "scalar" else ["0", "0", "0"]
     body.set("internalField", dictfile.make_uniform(default))
     bf = FoamDict()
     for name in patches:
@@ -304,9 +313,15 @@ def find_bc_type(category: str, name: str) -> BCType | None:
 # ---------------------------------------------------------------------------
 # 推荐边界条件
 # ---------------------------------------------------------------------------
-_INLET_HINTS = ("inlet", "in", "inflow", "inflow", "freestream", "farfield", "far")
+_INLET_HINTS = ("inlet", "in", "inflow", "entry")
 _OUTLET_HINTS = ("outlet", "out", "outflow", "exit", "pressureoutlet")
-_WALL_HINTS = ("wall", "walls", "foil", "blade", "wing", "hub", "shroud", "surface", "body")
+#: 外流边界(远场/来流): 用 freestreamVelocity/freestreamPressure/freestream
+_FARFIELD_HINTS = ("farfield", "far", "freestream", "atm", "atmosphere", "free", "external")
+#: 壁面类: 名字里带这些词就按壁面给 noSlip(而不是靠 type wall, 因为有的工具全导成 wall)
+_WALL_HINTS = (
+    "wall", "walls", "foil", "blade", "wing", "hub", "shroud", "surface", "body",
+    "top", "bottom", "side", "left", "right", "ceiling", "ground", "floor",
+)
 
 
 def _tokens(name: str) -> list[str]:
@@ -337,6 +352,8 @@ def _classify_patch(name: str, ptype: str) -> str:
         return "outlet"
     if _hit(toks, _INLET_HINTS):
         return "inlet"
+    if _hit(toks, _FARFIELD_HINTS):
+        return "farfield"
     if _hit(toks, _WALL_HINTS):
         return "wall"
     if ptype == "wall":
@@ -346,11 +363,57 @@ def _classify_patch(name: str, ptype: str) -> str:
     return "other"
 
 
+#: 湍流场在"入口/出口/壁面"上最常用的边界条件。
+#  统计自 OpenFOAM 13 ``tutorials/incompressibleFluid`` 的 53 个案例(出现次数最多的):
+#    k:       inlet fixedValue / outlet inletOutlet / wall kqRWallFunction
+#    epsilon: inlet fixedValue / outlet inletOutlet / wall epsilonWallFunction
+#    omega:   inlet fixedValue / outlet inletOutlet / wall omegaWallFunction
+#    nuTilda: inlet fixedValue / outlet zeroGradient / wall zeroGradient   <- 不是 nut 的壁面函数!
+#    nut:     inlet/outlet calculated                            / wall nutkWallFunction
+_TURBULENCE_BCS: dict[str, dict[str, str]] = {
+    "k": {"inlet": "fixedValue", "outlet": "inletOutlet", "wall": "kqRWallFunction"},
+    "epsilon": {"inlet": "fixedValue", "outlet": "inletOutlet", "wall": "epsilonWallFunction"},
+    "omega": {"inlet": "fixedValue", "outlet": "inletOutlet", "wall": "omegaWallFunction"},
+    "nuTilda": {"inlet": "fixedValue", "outlet": "zeroGradient", "wall": "zeroGradient"},
+    "nut": {"inlet": "calculated", "outlet": "calculated", "wall": "nutkWallFunction"},
+    "alphat": {"inlet": "calculated", "outlet": "calculated", "wall": "alphatWallFunction"},
+}
+
+
+def _bc_params_for(bc: str, category: str) -> dict[str, Any]:
+    """给出某个边界条件"跑起来"所需的最小参数(值取 $internalField, 后续可改)。"""
+    if bc in ("fixedValue", "uniformFixedValue"):
+        key = "uniformValue" if bc == "uniformFixedValue" else "value"
+        return {key: "$internalField"}
+    if bc in ("inletOutlet", "outletInlet"):
+        return {"inletValue": "$internalField", "value": "$internalField"}
+    if bc == "freestream":
+        return {"freestreamValue": "$internalField"}
+    if bc == "calculated":
+        # OpenFOAM 里 calculated 派生自 fixedValue, 同样需要 value 条目,
+        # 否则报 "Essential entry 'value' missing"
+        return {"value": "$internalField"}
+    if bc in ("freestreamVelocity", "freestreamPressure"):
+        key = "freestreamValue"
+        return {key: "$internalField"}
+    if bc in ("kqRWallFunction", "epsilonWallFunction", "omegaWallFunction",
+              "nutkWallFunction", "nutUSpaldingWallFunction", "nutUWallFunction",
+              "alphatWallFunction"):
+        return {"value": "$internalField"}
+    return {}
+
+
 def recommend_bc(category: str, field_name: str, patch_name: str, patch_type: str) -> tuple[str, dict[str, Any]]:
     """给出推荐边界条件, 返回 ``(类型, {参数: 值})``。
 
-    对 airFoil2D 这类外流案例会自动给出
-    ``freestreamVelocity/freestreamPressure/freestream + $internalField``。
+    推荐值按 OpenFOAM 13 官方教程(``tutorials/incompressibleFluid``)里的主流用法来定,
+    并且**区分入口/出口/壁面/远场**:
+
+    * 速度:   入口 fixedValue, 出口 zeroGradient, 壁面 noSlip, 远场 freestreamVelocity;
+    * 压力:   入口 zeroGradient, 出口 fixedValue, 壁面 zeroGradient, 远场 freestreamPressure
+              (出口固定压力同时充当"压力参考", 这样封闭域就不需要 pRefCell 了);
+    * 湍流场: 见 ``_TURBULENCE_BCS``(k/epsilon/omega 用同名壁面函数, nuTilda 用 zeroGradient,
+              nut 在非壁面用 calculated)。
     """
     cls = _classify_patch(patch_name, patch_type)
     if cls == "empty":
@@ -361,40 +424,55 @@ def recommend_bc(category: str, field_name: str, patch_name: str, patch_type: st
     if category == "velocity":
         if cls == "wall":
             return ("noSlip", {})
-        if cls in ("inlet", "outlet", "farfield"):
-            return ("freestreamVelocity", {"freestreamValue": "$internalField"})
+        if cls == "inlet":
+            return ("fixedValue", _bc_params_for("fixedValue", category))
+        if cls == "outlet":
+            return ("zeroGradient", {})
+        if cls == "farfield":
+            return ("freestreamVelocity", _bc_params_for("freestreamVelocity", category))
         return ("zeroGradient", {})
 
     if category == "pressure":
         if cls == "wall":
             return ("zeroGradient", {})
-        if cls in ("inlet", "outlet", "farfield"):
-            return ("freestreamPressure", {"freestreamValue": "$internalField"})
+        if cls == "inlet":
+            return ("zeroGradient", {})
+        if cls == "outlet":
+            return ("fixedValue", {"value": ["0"]})
+        if cls == "farfield":
+            return ("freestreamPressure", _bc_params_for("freestreamPressure", category))
         return ("zeroGradient", {})
 
     if category == "turbulence":
+        low = field_name.lower()
+        table = None
+        for key, val in _TURBULENCE_BCS.items():
+            if low == key.lower() or low.startswith(key.lower()):
+                table = val
+                break
+        if table is None:
+            table = {"inlet": "fixedValue", "outlet": "inletOutlet", "wall": "zeroGradient"}
         if cls == "wall":
-            low = field_name.lower()
-            if low.startswith("nut"):
-                return ("nutUSpaldingWallFunction", {"value": ["0"]})
-            if low == "k":
-                return ("kqRWallFunction", {"value": ["0"]})
-            if low == "epsilon":
-                return ("epsilonWallFunction", {"value": ["0"]})
-            if low == "omega":
-                return ("omegaWallFunction", {"value": ["0"]})
-            if low == "alphat":
-                return ("alphatWallFunction", {"value": ["0"]})
-            return ("fixedValue", {"value": ["0"]})
-        if cls in ("inlet", "outlet", "farfield"):
-            return ("freestream", {"freestreamValue": "$internalField"})
-        return ("zeroGradient", {})
+            bc = table["wall"]
+        elif cls == "inlet":
+            bc = table["inlet"]
+        elif cls == "outlet":
+            bc = table["outlet"]
+        elif cls == "farfield":
+            bc = "freestream"          # 外流: k/omega/nuTilda 常用 freestream
+        else:
+            bc = "calculated" if low.startswith("nut") or low.startswith("alphat") else "zeroGradient"
+        return (bc, _bc_params_for(bc, category))
 
     # 一般标量
     if cls == "wall":
         return ("zeroGradient", {})
-    if cls in ("inlet", "outlet", "farfield"):
-        return ("inletOutlet", {"inletValue": "$internalField"})
+    if cls == "inlet":
+        return ("fixedValue", _bc_params_for("fixedValue", category))
+    if cls == "outlet":
+        return ("inletOutlet", _bc_params_for("inletOutlet", category))
+    if cls == "farfield":
+        return ("inletOutlet", _bc_params_for("inletOutlet", category))
     return ("zeroGradient", {})
 
 

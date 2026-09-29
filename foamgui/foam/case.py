@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import shutil
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from . import dictfile, fields as fields_mod, polymesh
+from . import dictfile, fields as fields_mod, polymesh, validate
 from .fields import apply_params
 from .dictfile import FoamDict
 
@@ -368,10 +369,13 @@ class FoamCase:
             self.system["controlDict"] = (_default_control_dict(), "dictionary")
             self.warnings.append("未找到 system/controlDict, 已使用默认值")
         if "fvSchemes" not in self.system:
-            self.system["fvSchemes"] = (_default_fv_schemes(), "dictionary")
+            self.system["fvSchemes"] = (_default_fv_schemes(self.fields), "dictionary")
             self.warnings.append("未找到 system/fvSchemes, 已使用默认值")
         if "fvSolution" not in self.system:
-            self.system["fvSolution"] = (_default_fv_solution(self.field_categories()), "dictionary")
+            self.system["fvSolution"] = (
+                _default_fv_solution(self.field_categories(), self.pressure_needs_reference()),
+                "dictionary",
+            )
             self.warnings.append("未找到 system/fvSolution, 已使用默认值")
         if "momentumTransport" not in self.constant:
             self.constant["momentumTransport"] = (
@@ -383,6 +387,65 @@ class FoamCase:
                 self.warnings.append(f"未找到 constant/momentumTransport, 已按案例里的场选择 {sim}")
         if "physicalProperties" not in self.constant:
             self.constant["physicalProperties"] = (_default_physical_properties(), "dictionary")
+
+    def pressure_needs_reference(self) -> bool:
+        """压力边界全是零梯度/对称 -> 需要 pRefCell/pRefValue。"""
+        return validate.pressure_needs_reference(self)
+
+    def ensure_schemes_for_fields(self, names: Iterable[str] | None = None) -> list[str]:
+        """给(新加的)场补上 fvSchemes 的 div 项和 fvSolution 的 solver 项。
+
+        只添加**缺失**的条目, 不动已有的内容。返回被补上的条目说明, 例如
+        ``["fvSchemes: div(phi,k)", "fvSolution: solvers/k"]``。
+        """
+        names = [n for n in (names if names is not None else self.fields)]
+        added: list[str] = []
+        schemes = self.get("system", "fvSchemes")
+        if schemes is not None:
+            div = dictfile.get_dict(schemes, "divSchemes")
+            if div is None:
+                div = FoamDict()
+                schemes.set("divSchemes", div)
+            if "div(phi,U)" not in div and "U" in self.fields:
+                div.set("div(phi,U)", "bounded Gauss linearUpwind grad(U)")
+                added.append("fvSchemes: div(phi,U)")
+            if "div((nuEff*dev2(T(grad(U)))))" not in div and "U" in self.fields:
+                div.set("div((nuEff*dev2(T(grad(U)))))", "Gauss linear")
+                added.append("fvSchemes: div((nuEff*dev2(T(grad(U)))))")
+            for n in names:
+                scheme = _TURB_DIV_SCHEMES.get(n)
+                if scheme and f"div(phi,{n})" not in div:
+                    div.set(f"div(phi,{n})", scheme)
+                    added.append(f"fvSchemes: div(phi,{n})")
+        solution = self.get("system", "fvSolution")
+        if solution is not None:
+            solvers = dictfile.get_dict(solution, "solvers")
+            if solvers is None:
+                solvers = FoamDict()
+                solution.set("solvers", solvers)
+            for n in names:
+                if n in solvers:
+                    continue
+                spec = fields_mod.FIELD_CATALOG.get(n)
+                is_pressure = (spec.category == "pressure") if spec else n.startswith("p")
+                entry = FoamDict()
+                if is_pressure:
+                    entry.set("solver", "GAMG")
+                    entry.set("smoother", "GaussSeidel")
+                    entry.set("tolerance", "1e-06")
+                    entry.set("relTol", "0.1")
+                elif spec is not None and spec.category == "turbulence":
+                    for k, v in _TURB_SOLVER.items():
+                        entry.set(k, v)
+                else:
+                    entry.set("solver", "smoothSolver")
+                    entry.set("smoother", "GaussSeidel")
+                    entry.set("nSweeps", "2")
+                    entry.set("tolerance", "1e-08")
+                    entry.set("relTol", "0.1")
+                solvers.set(n, entry)
+                added.append(f"fvSolution: solvers/{n}")
+        return added
 
     def field_categories(self) -> dict[str, tuple[str, str]]:
         """``{场名: (类别, 类型kind)}``。"""
@@ -551,14 +614,38 @@ def _default_control_dict() -> FoamDict:
     return d
 
 
-def _default_fv_schemes() -> FoamDict:
+#: 湍流场 -> 它在 divSchemes 里的对流格式。
+#  用 **bounded** 形式: 工具生成的默认是稳态(SIMPLE)求解, 无界格式在高库朗数下
+#  容易把 k/omega 算成负值或发散(实测 kOmegaSST 会在第二个时间步 SIGFPE 崩掉)。
+#  这也正是 OpenFOAM 13 教程里稳态案例的写法(`turbulence bounded Gauss limitedLinear 1;`)。
+_TURB_DIV_SCHEMES = {
+    "k": "bounded Gauss limitedLinear 1",
+    "epsilon": "bounded Gauss limitedLinear 1",
+    "omega": "bounded Gauss limitedLinear 1",
+    "nuTilda": "bounded Gauss limitedLinear 1",
+}
+
+
+def _default_fv_schemes(field_names: Iterable[str] | None = None) -> FoamDict:
+    """默认 fvSchemes。
+
+    ``divSchemes`` 里要**按案例实际存在的场**给出对流格式: 少写一个
+    ``div(phi,k)`` 求解器就会报 "keyword div(phi,k) is undefined"。
+    """
+    names = set(field_names or ())
     d = FoamDict()
     d.set("ddtSchemes", FoamDict([("default", "steadyState")]))
-    d.set("gradSchemes", FoamDict([("default", "Gauss linear")]))
+    grad = FoamDict()
+    grad.set("default", "Gauss linear")
+    grad.set("grad(U)", "cellLimited Gauss linear 1")   # 稳态下更稳(教程同款)
+    d.set("gradSchemes", grad)
     div = FoamDict()
     div.set("default", "none")
     div.set("div(phi,U)", "bounded Gauss linearUpwind grad(U)")
     div.set("div((nuEff*dev2(T(grad(U)))))", "Gauss linear")
+    for name, scheme in _TURB_DIV_SCHEMES.items():
+        if name in names:
+            div.set(f"div(phi,{name})", scheme)
     d.set("divSchemes", div)
     d.set("laplacianSchemes", FoamDict([("default", "Gauss linear corrected")]))
     d.set("interpolationSchemes", FoamDict([("default", "linear")]))
@@ -567,7 +654,16 @@ def _default_fv_schemes() -> FoamDict:
     return d
 
 
-def _default_fv_solution(categories: dict[str, tuple[str, str]]) -> FoamDict:
+#: 湍流标量场的线性求解器: 这些方程是**非对称**的, 实测用
+#  smoothSolver/symGaussSeidel 在多面体网格上容易把 omega 算发散
+#  (残差 1e185, 然后 k 溢出触发 SIGFPE), 换成 PBiCGStab + DILU 就稳了。
+_TURB_SOLVER = {"solver": "PBiCGStab", "preconditioner": "DILU",
+                "tolerance": "1e-06", "relTol": "0.1"}
+
+
+def _default_fv_solution(
+    categories: dict[str, tuple[str, str]], needs_p_ref: bool = False
+) -> FoamDict:
     d = FoamDict()
     solvers = FoamDict()
     for name, (cat, _kind) in categories.items():
@@ -577,6 +673,9 @@ def _default_fv_solution(categories: dict[str, tuple[str, str]]) -> FoamDict:
             s.set("smoother", "GaussSeidel")
             s.set("tolerance", "1e-06")
             s.set("relTol", "0.1")
+        elif cat == "turbulence":
+            for k, v in _TURB_SOLVER.items():
+                s.set(k, v)
         else:
             s.set("solver", "smoothSolver")
             s.set("smoother", "GaussSeidel")
@@ -588,6 +687,11 @@ def _default_fv_solution(categories: dict[str, tuple[str, str]]) -> FoamDict:
     simple = FoamDict()
     simple.set("nNonOrthogonalCorrectors", "0")
     simple.set("consistent", "yes")
+    if needs_p_ref:
+        # 封闭域(压力边界全是零梯度/对称)必须给一个参考单元, 否则求解器报
+        # "Unable to set reference cell for field p"
+        simple.set("pRefCell", "0")
+        simple.set("pRefValue", "0")
     d.set("SIMPLE", simple)
     relax = FoamDict()
     f = FoamDict()

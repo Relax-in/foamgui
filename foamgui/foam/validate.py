@@ -27,7 +27,7 @@ from .fields import (
     TURBULENCE_FIELDS,
 )
 
-__all__ = ["Issue", "check_case", "looks_like_solver"]
+__all__ = ["Issue", "check_case", "looks_like_solver", "pressure_needs_reference"]
 
 
 @dataclass
@@ -176,6 +176,25 @@ def _check_control_dict(case) -> list[Issue]:
             "OpenFOAM 13 只用 solver, 这条是导出工具留下的占位; 可以手工删掉",
         ))
     return out
+
+
+def pressure_needs_reference(case) -> bool:
+    """压力是否需要 pRefCell/pRefValue: 边界里没有任何"固定压力"的边界条件。
+
+    封闭域(例如四周都是壁面/对称面)的压力方程是纯 Neumann 的, 必须给参考单元;
+    有 fixedValue/totalPressure 这类边界时不需要。
+    """
+    if case.mesh is None or not case.fields:
+        return False
+    for pname in ("p", "p_rgh"):
+        pf = case.fields.get(pname)
+        if pf is None:
+            continue
+        for patch in case.mesh.patches:
+            if pf.patch_type(patch.name) in _PRESSURE_FIXING_BCS:
+                return False
+        return True
+    return False
 
 
 def _check_pressure_reference(case) -> list[Issue]:

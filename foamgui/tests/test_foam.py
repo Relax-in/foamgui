@@ -223,18 +223,40 @@ def test_exporter_compat() -> None:
 
 def test_fields() -> None:
     section("边界条件推荐")
+    # 推荐值按 OpenFOAM 13 教程(incompressibleFluid)里的主流用法, 并区分入口/出口/壁面/远场
     bc, params = fields.recommend_bc("velocity", "U", "inlet", "patch")
-    check(bc == "freestreamVelocity" and params["freestreamValue"] == "$internalField", "U/inlet 推荐错误")
+    check(bc == "fixedValue", f"U/inlet 应推荐 fixedValue, 实际 {bc}")
+    bc, _p = fields.recommend_bc("velocity", "U", "outlet", "patch")
+    check(bc == "zeroGradient", f"U/outlet 应推荐 zeroGradient, 实际 {bc}")
     bc, _p = fields.recommend_bc("velocity", "U", "walls", "wall")
     check(bc == "noSlip", "U/walls 推荐错误")
     bc, _p = fields.recommend_bc("velocity", "U", "frontAndBack", "empty")
     check(bc == "empty", "U/frontAndBack 推荐错误")
+    bc, _p = fields.recommend_bc("velocity", "U", "farfield", "patch")
+    check(bc == "freestreamVelocity", f"U/farfield 应推荐 freestreamVelocity, 实际 {bc}")
+    # 出口固定压力同时充当压力参考, 封闭域才需要 pRefCell
     bc, params = fields.recommend_bc("pressure", "p", "outlet", "patch")
-    check(bc == "freestreamPressure", "p/outlet 推荐错误")
-    bc, _p = fields.recommend_bc("turbulence", "nut", "walls", "wall")
-    check(bc.endswith("WallFunction"), "nut/walls 应当推荐壁面函数")
+    check(bc == "fixedValue" and params["value"] == ["0"], f"p/outlet 推荐错误: {bc}")
+    bc, _p = fields.recommend_bc("pressure", "p", "inlet", "patch")
+    check(bc == "zeroGradient", f"p/inlet 应推荐 zeroGradient, 实际 {bc}")
+
+    # 湍流场: 各场用各自的壁面函数, nut 在非壁面用 calculated
+    for fld, expected in (("k", "kqRWallFunction"), ("epsilon", "epsilonWallFunction"),
+                          ("omega", "omegaWallFunction"), ("nut", "nutkWallFunction")):
+        bc, params = fields.recommend_bc("turbulence", fld, "walls", "wall")
+        check(bc == expected, f"{fld}/walls 应推荐 {expected}, 实际 {bc}")
+        check("value" in params, f"{fld}/walls 的壁面函数必须有 value")
+    bc, _p = fields.recommend_bc("turbulence", "nuTilda", "walls", "wall")
+    check(bc == "zeroGradient", f"nuTilda/walls 应当是 zeroGradient(不是 nut 的壁面函数), 实际 {bc}")
+    bc, params = fields.recommend_bc("turbulence", "nut", "inlet", "patch")
+    check(bc == "calculated" and params.get("value"), "nut 在入口应当是 calculated 且带 value")
+    bc, _p = fields.recommend_bc("turbulence", "k", "outlet", "patch")
+    check(bc == "inletOutlet", f"k/outlet 应推荐 inletOutlet, 实际 {bc}")
+
     names = [t.name for t in fields.bc_types_for("velocity", "empty")]
     check("empty" in names and "noSlip" not in names, "empty 补片的可用类型过滤错误")
+    names = [t.name for t in fields.bc_types_for("velocity", "wall")]
+    check("noSlip" in names and "symmetry" not in names, "wall 补片不应给出约束型边界 symmetry")
 
 
 def test_case_roundtrip() -> None:

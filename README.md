@@ -253,7 +253,44 @@ VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直�
 这样既不依赖 OpenGL 后端的行为，也不受驱动/软件渲染影响；VTK 的交互样式照常收到事件，
 所以旋转/平移/缩放不受影响（拖动超过 4 px 就不算点击）。
 
-### 4.4 界面稳定性：不让内部错误把程序带走
+### 4.4 不可压缩案例的字典生成（当前重点）
+
+目标是：**给出 `constant/polyMesh`（和 `0/` 里的场），工具就能生成一套能跑起来的
+不可压缩字典**。默认值的选法全部来自 OpenFOAM 13 官方教程
+（`tutorials/incompressibleFluid`，53 个案例）里的主流用法：
+
+* **模板按案例实际情况生成**
+  * `divSchemes` 里会为 `0/` 中**实际存在**的每个湍流场补上 `div(phi,k)` /
+    `div(phi,epsilon)` / `div(phi,omega)` / `div(phi,nuTilda)`
+    （少一条求解器就会报 `keyword div(phi,k) is undefined`）；
+  * `fvSolution/solvers` 为每个场生成条目：`p` 用 `GAMG`，速度用
+    `smoothSolver`，**湍流标量用 `PBiCGStab + DILU`** —— 这些方程是非对称的，
+    实测在多面体网格上用 `smoothSolver/symGaussSteidel` 会把 `omega` 算发散
+    （残差冲到 1e185，随后 `k` 溢出触发 SIGFPE）；
+  * 湍流场的对流格式默认 `bounded Gauss limitedLinear 1`（稳态下更稳）；
+  * **压力参考按需写入**：当 `p`/`p_rgh` 的边界里没有任何固定压力的边界条件时
+    （封闭域），自动写上 `pRefCell 0; pRefValue 0;`；出口用 `fixedValue` 压力时
+    则不需要。
+
+* **边界条件推荐按教程数据定**（区分入口/出口/壁面/远场）
+  | 场 | 入口 | 出口 | 壁面 | 远场 |
+  |---|---|---|---|---|
+  | `U` | `fixedValue` | `zeroGradient` | `noSlip` | `freestreamVelocity` |
+  | `p` | `zeroGradient` | `fixedValue 0` | `zeroGradient` | `freestreamPressure` |
+  | `k` | `fixedValue` | `inletOutlet` | `kqRWallFunction` | `freestream` |
+  | `epsilon` | `fixedValue` | `inletOutlet` | `epsilonWallFunction` | `freestream` |
+  | `omega` | `fixedValue` | `inletOutlet` | `omegaWallFunction` | `freestream` |
+  | `nuTilda` | `fixedValue` | `zeroGradient` | `zeroGradient` | `freestream` |
+  | `nut` | `calculated` | `calculated` | `nutkWallFunction` | `calculated` |
+
+* **缺的场一键补齐**：`0/` 里没有模型需要的场时，「求解设置 → 湍流模型」里有
+  **「补齐该模型需要的场」**按钮，会按推荐边界条件创建这些场，并在
+  `fvSchemes`/`fvSolution` 里同步补上对应条目。新建的湍流场初值不再是 0
+  （`k = 0.1`、`omega = 1`…）—— **`omega = 0` 会让 kOmegaSST 直接除零崩溃**。
+
+* 目前**只针对不可压缩**（`incompressibleFluid`）：VoF/多相/可压缩的模板尚未适配。
+
+### 4.5 界面稳定性：不让内部错误把程序带走
 
 PyQt6 默认会把「Qt 槽函数里未捕获的 Python 异常」升级成致命错误并直接 `abort()`，
 表现出来就是"点一下某个控件，窗口整个消失"（闪退）。所以：
@@ -265,7 +302,7 @@ PyQt6 默认会把「Qt 槽函数里未捕获的 Python 异常」升级成致命
   避免把正在发信号的下拉框/还没提交的单元格编辑器连同弹窗一起销毁；
 * 主窗口的处理函数外面再包一层 `try/except`，任何意外都只影响这一次操作。
 
-### 4.5 3D 场景与 Qt 解耦
+### 4.6 3D 场景与 Qt 解耦
 
 `MeshScene` 是纯 VTK 的，不依赖 Qt；Qt 那边只是用一个 `QVTKRenderWindowInteractor` 承载它。
 因此可以在无图形界面的环境下用离屏渲染出图（`foamgui/tests/render_preview.py`），
@@ -327,12 +364,16 @@ LIBGL_ALWAYS_SOFTWARE=1 python -m foamgui.tests.render_preview airFoil2D _scratc
 python -m foamgui.tests.e2e_openfoam airFoil2D
 #    -> foamDictionary 校验全部通过; checkMesh 返回码 0; foamRun 返回码 0, 生成 5/ 结果目录
 
-# 6) 只有网格的案例(例如 ANSA 导出的 111): 同样能验证, 只是跳过求解器
+# 6) 只给"网格 + 0/", 让工具生成整套字典再真跑(层流 / kOmegaSST / SpalartAllmaras)
+python -m foamgui.tests.e2e_generate airFoil2D
+#    -> 三种模式都: 自检未发现问题, foamRun 返回码 0
+
+# 7) 只有网格的案例(例如 ANSA 导出的 111): 同样能验证, 只是跳过求解器
 python -m foamgui.tests.e2e_openfoam 111
 #    -> checkMesh 返回码 0, Mesh OK.; 求解器是 UserSolver 占位, 跳过 foamRun
 ```
 
-上面 2)~6) 这些测试都是**按案例自适应的**（补片名、场名都从案例里现取），所以换任何算例都能直接跑。
+上面 2)~7) 这些测试都是**按案例自适应的**（补片名、场名都从案例里现取），所以换任何算例都能直接跑。
 
 第 5 项在 airFoil2D 上的实际输出（节选）：
 

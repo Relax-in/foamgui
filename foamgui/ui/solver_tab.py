@@ -49,6 +49,7 @@ class SolverTab(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
     statusMessage = QtCore.pyqtSignal(str)
+    fieldsChanged = QtCore.pyqtSignal()      # 新增了 0/ 里的场, 需要刷新边界/初始条件页
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -242,6 +243,28 @@ class SolverTab(QtWidgets.QWidget):
                      self._on_sim_type, editable=False)
         sim = dictfile.get_atom(d, "simulationType", "RAS")
         if sim in ("RAS", "LES"):
+            # 一键补齐该模型需要的场(k/omega/epsilon/nuTilda/nut):
+            # 少了任何一个, 求解器都会报 "cannot find field ..."
+            sub_preview = dictfile.get_dict(d, sim)
+            model_now = dictfile.get_atom(sub_preview, "model", "") if sub_preview else ""
+            needed = fields_mod.TURBULENCE_FIELDS.get(model_now or "", [])
+            missing = [n for n in needed if self.case is not None and n not in self.case.fields]
+            bar = QtWidgets.QHBoxLayout()
+            btn = QtWidgets.QPushButton("补齐该模型需要的场")
+            btn.setToolTip(
+                "在 0/ 里自动添加该湍流模型需要的场(用推荐边界条件),\n"
+                "并在 fvSchemes/fvSolution 里补上对应的条目"
+            )
+            btn.setEnabled(bool(missing))
+            btn.clicked.connect(self._add_missing_fields)
+            bar.addWidget(btn)
+            info = QtWidgets.QLabel(
+                f"需要: {'、'.join(needed) or '(无)'}" + (f"; 缺少: {'、'.join(missing)}" if missing else " (已齐全)")
+            )
+            info.setEnabled(False)
+            bar.addWidget(info, 1)
+            f.addRow(bar)
+        if sim in ("RAS", "LES"):
             sub = dictfile.get_dict(d, sim)
             if sub is None:
                 sub = FoamDict()
@@ -269,6 +292,31 @@ class SolverTab(QtWidgets.QWidget):
             hint = QtWidgets.QLabel("层流: 只需要 0/U 与 0/p, 湍流场可以不要")
             hint.setEnabled(False)
             f.addRow(hint)
+
+    def _add_missing_fields(self) -> None:
+        """按当前湍流模型补齐 0/ 里缺少的场, 并补上字典条目。"""
+        if self.case is None:
+            return
+        sim = dictfile.get_atom(self._mt, "simulationType", "laminar")
+        sub = dictfile.get_dict(self._mt, sim)
+        model = dictfile.get_atom(sub, "model", "") if sub else ""
+        needed = fields_mod.TURBULENCE_FIELDS.get(model or "", [])
+        missing = [n for n in needed if n not in self.case.fields]
+        if not missing:
+            self.statusMessage.emit("该模型需要的场已经齐全")
+            return
+        for name in missing:
+            self.case.add_field(name)
+        self.case.sync_patches()
+        added = self.case.ensure_schemes_for_fields(missing)
+        self._fill_schemes()
+        self._fill_solution()
+        self.changed.emit()
+        self.fieldsChanged.emit()
+        msg = f"已添加场 {'、'.join(missing)}"
+        if added:
+            msg += "; 同时补上 " + "、".join(added)
+        self.statusMessage.emit(msg)
 
     def _commit_all(self) -> None:
         """把各表单当前显示的值全部写进字典(显式补齐默认条目)。"""
