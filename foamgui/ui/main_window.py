@@ -238,6 +238,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_recent = QtGui.QAction("最近打开的案例", self)
         self.menu_recent = QtWidgets.QMenu("最近打开的案例", self)
 
+        self.act_blockmesh = QtGui.QAction("生成网格 (blockMesh)…", self)
+        self.act_blockmesh.setToolTip(
+            "运行 blockMesh, 用案例里的 system/blockMeshDict 生成 constant/polyMesh。\n"
+            "有的案例(例如教程里的 cavity)只带 blockMeshDict, 没有网格文件。"
+        )
+        self.act_blockmesh.triggered.connect(self._run_block_mesh)
+        self.act_blockmesh.setEnabled(False)
+
         self.act_write = QtGui.QAction("写出字典文件…", self)
         self.act_write.setShortcut("Ctrl+S")
         self.act_write.triggered.connect(self._write_dicts)
@@ -257,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         m.addAction(self.act_reload)
         m.addMenu(self.menu_recent)
         m.addSeparator()
+        m.addAction(self.act_blockmesh)
         m.addAction(self.act_write)
         m.addSeparator()
         m.addAction(self.act_quit)
@@ -283,6 +292,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setMovable(False)
         tb.addAction(self.act_open)
         tb.addAction(self.act_reload)
+        tb.addAction(self.act_blockmesh)
         tb.addSeparator()
         tb.addAction(self.act_write)
         self._reload_recent_menu()
@@ -323,14 +333,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path = Path(path)
         if not (path / "constant" / "polyMesh").exists():
-            ok = QtWidgets.QMessageBox.question(
-                self,
-                "目录里没有 constant/polyMesh",
-                f"{path}\n没有找到 constant/polyMesh, 仍然要打开吗?\n"
-                "(没有网格时无法读取补片名, 边界条件只能手工添加)",
+            has_block_dict = any(
+                (path / "system" / n).exists() for n in ("blockMeshDict", "blockMeshDict.gz")
             )
-            if ok != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
+            if has_block_dict:
+                # 教程里的 cavity 这类案例只带 blockMeshDict, 需要先建模
+                ok = QtWidgets.QMessageBox.question(
+                    self,
+                    "案例还没有网格",
+                    f"{path}\n\n这个案例只有 system/blockMeshDict, 还没有 constant/polyMesh。\n"
+                    "现在运行 blockMesh 生成网格吗?",
+                )
+                if ok == QtWidgets.QMessageBox.StandardButton.Yes:
+                    if not self._generate_mesh(path):
+                        return
+            else:
+                ok = QtWidgets.QMessageBox.question(
+                    self,
+                    "目录里没有 constant/polyMesh",
+                    f"{path}\n没有找到 constant/polyMesh, 仍然要打开吗?\n"
+                    "(没有网格时无法读取补片名, 边界条件只能手工添加)",
+                )
+                if ok != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
             case = FoamCase(path)
@@ -379,6 +404,42 @@ class MainWindow(QtWidgets.QMainWindow):
             f"已打开案例 {case.root}   场: {', '.join(case.fields.keys()) or '(无)'}   "
             f"补片: {', '.join(case.patch_names) or '(无)'}"
         )
+
+    def _generate_mesh(self, path: Path) -> bool:
+        """对 ``path`` 运行 blockMesh(打开案例前的预生成)。成功返回 True。"""
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            case = FoamCase(path)
+            case.load()
+            ok, out = case.run_block_mesh()
+        except Exception as exc:
+            ok, out = False, str(exc)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not ok:
+            tail = "\n".join([l for l in out.splitlines() if l.strip()][-12:])
+            QtWidgets.QMessageBox.critical(
+                self, "blockMesh 失败", f"生成网格失败:\n\n{tail}"
+            )
+            return False
+        n = case.mesh.n_cells if case.mesh else 0
+        self.show_message(f"blockMesh 完成: {n} 个单元, {len(case.patch_names)} 个补片")
+        return True
+
+    def _run_block_mesh(self) -> None:
+        """菜单/工具栏: 对当前案例运行 blockMesh, 然后重新加载。"""
+        if self.case is None:
+            return
+        if self.case.block_mesh_dict is None:
+            QtWidgets.QMessageBox.information(
+                self, "没有 blockMeshDict",
+                "这个案例里没有 system/blockMeshDict, 不能用 blockMesh 生成网格。",
+            )
+            return
+        if not self._generate_mesh(self.case.root):
+            return
+        # 重新打开(会重新读网格并刷新所有面板)
+        self.load_case(self.case.root)
 
     def _refresh_case_tree(self) -> None:
         t = self.case_tree

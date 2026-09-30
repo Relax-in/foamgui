@@ -136,14 +136,38 @@ class Compound(list):
     """由多个 token 组成的值, 例如 ``uniform (0 0 0)``。"""
 
 
+class Directive:
+    """OpenFOAM 的预处理指令行, 例如 ``#includeEtc "caseDicts/setConstraintTypes"``。
+
+    整行原样保留: 指令后面的条目不能被吞进它的"值"里(否则写回时会写坏文件),
+    重复出现多次的指令也必须按原顺序保留。
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"Directive({self.text!r})"
+
+
 class Dimensioned:
-    """带量纲的值: ``[0 2 -1 0 0 0 0] 1e-05``。"""
+    """带量纲的值。
 
-    __slots__ = ("dims", "value")
+    OpenFOAM 里有两种写法, 必须原样保留(顺序反了虽然多数场合也能读, 但没必要冒险):
 
-    def __init__(self, dims: list[str], value: Any):
+    * 量纲在前: ``dimensions [0 2 -1 0 0 0 0];``、``nu [0 2 -1 0 0 0 0] 1e-05;``
+    * 值在前:   ``nu 1e-05 [m^2/s];``(OpenFOAM 10 之后支持的"单位"写法,
+                ``rho 1 [kg/m^3];`` 同理)
+    """
+
+    __slots__ = ("dims", "value", "dims_first")
+
+    def __init__(self, dims: list[str], value: Any, dims_first: bool = True):
         self.dims = list(dims)
         self.value = value
+        self.dims_first = dims_first
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"Dimensioned({self.dims!r}, {self.value!r})"
@@ -213,6 +237,59 @@ def tokenize(text: str, start: int = 0) -> list[_Token]:
         if kind in ("block", "line"):
             continue
         tok = m.group()
+        if kind == "word" and tok.startswith("#"):
+            # 预处理/函数指令(#includeEtc/#ifeq/#calc/#neg/#codeStream ...):
+            # 吃到行尾, 但要
+            #   * 跳过字符串里的括号(例如 #calc "sqrt(x)" 里的 ')');
+            #   * 遇到"不属于自己的"右括号就停 —— 例如
+            #     ``internalField uniform (#neg $UMean 0 0);`` 里指令在列表内部,
+            #     把 ')' 吞掉会让列表配不上对;
+            #   * 末尾的分号不算指令的一部分(``wheelSpeed #calc "...";`` 是指令当值)。
+            i = pos
+            depth = 0
+            in_str = False
+            while i < n and text[i] != "\n":
+                c = text[i]
+                if in_str:
+                    if c == "\\":
+                        i += 2
+                        continue
+                    if c == '"':
+                        in_str = False
+                elif c == '"':
+                    in_str = True
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                i += 1
+            end = i
+            j = end
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] == "{":
+                # #codeStream 这类后面跟代码块的: 把块也一起吃掉
+                depth2 = 0
+                k = j
+                while k < n:
+                    if text[k] == "{":
+                        depth2 += 1
+                    elif text[k] == "}":
+                        depth2 -= 1
+                        if depth2 == 0:
+                            k += 1
+                            break
+                    k += 1
+                end = k
+            raw = text[m.start():end].rstrip()
+            if raw.endswith(";") and not raw.endswith(";"):
+                pass
+            raw = raw[:-1].rstrip() if raw.endswith(";") else raw
+            tokens.append(_Token("word", raw))
+            pos = end
+            continue
         if (
             kind == "word"
             and pos < n
@@ -276,21 +353,15 @@ class _Parser:
                 self.next()  # 空语句
                 continue
             key = self.next().text
+            if key.startswith("#"):
+                # 指令行: 原样保留(用 append 而不是 set, 因为同一条指令可以出现多次)
+                head = key.split()[0] if key.split() else key
+                d.items.append((head, Directive(key)))
+                continue
             nxt = self.peek()
             if nxt is not None and nxt.text == "{":
                 self.next()  # 吃掉 '{'
                 value: Any = self.parse_entries(top_level=False)
-            elif key.startswith("#"):
-                # 预处理指令: 收集到行尾/分号为止
-                parts = []
-                while True:
-                    t2 = self.peek()
-                    if t2 is None or t2.text in (";",) or t2.text == "}":
-                        if t2 is not None and t2.text == ";":
-                            self.next()
-                        break
-                    parts.append(self.next().text)
-                value = Compound(parts)
             else:
                 value = self.parse_value()
                 if self.peek() is not None and self.peek().text == ";":
@@ -321,6 +392,12 @@ class _Parser:
                 parts.append(self.parse_entries(top_level=False))
             elif t.text == "]":
                 break
+            elif t.text == "[":
+                # 值在前、量纲在后: ``nu 1e-05 [m^2/s];``
+                dims = self.parse_dims()
+                if len(parts) == 1:
+                    return Dimensioned(dims, parts[0], dims_first=False)
+                parts.append(Dimensioned(dims, Compound([])))
             else:
                 parts.append(self.next().text)
         if len(parts) == 1:
@@ -382,7 +459,11 @@ def format_value(v: Any, indent: int = 0) -> str:
     if isinstance(v, str):
         return v
     if isinstance(v, Dimensioned):
-        return ("[" + " ".join(v.dims) + "] " + format_value(v.value, indent)).rstrip()
+        dims = "[" + " ".join(v.dims) + "]"
+        val = format_value(v.value, indent).strip()
+        if not val:
+            return dims
+        return f"{dims} {val}" if getattr(v, "dims_first", True) else f"{val} {dims}"
     if isinstance(v, FoamDict):
         return format_dict(v, indent)
     if isinstance(v, FoamList):
@@ -467,6 +548,8 @@ def format_dict(d: FoamDict, indent: int = 0) -> str:
 
 def format_entry(key: str, value: Any, indent: int = 0) -> str:
     pad = " " * indent
+    if isinstance(value, Directive):
+        return pad + value.text
     if isinstance(value, FoamDict):
         return f"{key}\n" + format_dict(value, indent)
     body = format_value(value, indent)

@@ -322,6 +322,8 @@ _WALL_HINTS = (
     "wall", "walls", "foil", "blade", "wing", "hub", "shroud", "surface", "body",
     "top", "bottom", "side", "left", "right", "ceiling", "ground", "floor",
 )
+#: 运动壁面(例如 cavity 的 movingWall / 顶盖驱动): 速度要用 movingWallVelocity
+_MOVING_WALL_HINTS = ("moving", "lid", "sliding", "rotating", "belt")
 
 
 def _tokens(name: str) -> list[str]:
@@ -423,6 +425,9 @@ def recommend_bc(category: str, field_name: str, patch_name: str, patch_type: st
 
     if category == "velocity":
         if cls == "wall":
+            if _hit(_tokens(patch_name), _MOVING_WALL_HINTS):
+                # 运动壁面(顶盖驱动/皮带/转子): 用 movingWallVelocity, 值留给用户改
+                return ("movingWallVelocity", _bc_params_for("fixedValue", category))
             return ("noSlip", {})
         if cls == "inlet":
             return ("fixedValue", _bc_params_for("fixedValue", category))

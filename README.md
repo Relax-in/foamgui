@@ -253,7 +253,19 @@ VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直�
 这样既不依赖 OpenGL 后端的行为，也不受驱动/软件渲染影响；VTK 的交互样式照常收到事件，
 所以旋转/平移/缩放不受影响（拖动超过 4 px 就不算点击）。
 
-### 4.4 不可压缩案例的字典生成（当前重点）
+### 4.4 网格生成与"稳态/瞬态"一致性
+
+* **blockMesh**：`FoamCase.needs_block_mesh()` 判断"有 `blockMeshDict` 但没有
+  `polyMesh`"，`run_block_mesh()` 负责调用 OpenFOAM 的 `blockMesh` 并重新读网格；
+  界面上打开案例时会询问，也可以随时手动触发。
+* **生成的字典跟案例的时间格式一致**：`controlDict` 里 `deltaT` 明显小于 1
+  （例如 `cavity` 的 `0.005`）就按**瞬态**生成 —— `Euler` + `PIMPLE` +
+  `div(phi,U) Gauss limitedLinearV 1`，并补上 PIMPLE 需要的 `<场>Final`
+  求解器条目（缺了会报 `keyword UFinal is undefined`）；否则按**稳态**生成 ——
+  `steadyState` + `SIMPLE` + `bounded Gauss linearUpwind grad(U)`。
+  两者混用很容易直接发散（实测 cavity 用稳态跑会在第 59 步炸掉）。
+
+### 4.5 不可压缩案例的字典生成（当前重点）
 
 目标是：**给出 `constant/polyMesh`（和 `0/` 里的场），工具就能生成一套能跑起来的
 不可压缩字典**。默认值的选法全部来自 OpenFOAM 13 官方教程
@@ -290,7 +302,23 @@ VTK 对四面体的剖切/取边支持最完善，而把 OpenFOAM 多面体直�
 
 * 目前**只针对不可压缩**（`incompressibleFluid`）：VoF/多相/可压缩的模板尚未适配。
 
-### 4.5 界面稳定性：不让内部错误把程序带走
+### 4.6 字典语法兼容（读进来什么，写回去还是什么）
+
+`foamgui/foam/dictfile.py` 是"解析 → 修改 → 序列化"的核心，OpenFOAM 13 里几种
+容易写坏的写法都做了处理（并用教程的 1325 个字典文件做过"解析→渲染→再解析"
+的一致性扫描，**工具会写回的文件 0 处不一致**）：
+
+* **量纲的两种顺序**：`nu [0 2 -1 0 0 0 0] 1e-05;` 和 `nu 1e-05 [m^2/s];`
+  （OpenFOAM 10 之后支持的单位写法）都按原顺序保留；
+* **指令行**：`#include` / `#includeEtc` / `#ifeq` / `#else` / `#endif` /
+  `#calc` / `#neg` / `#codeStream`；
+  * 整行原样保留，且**不会把后面的条目吞进"值"里**（原先会，写回时直接写坏文件）；
+  * 指令出现在列表里（`internalField uniform (#neg $UMean 0 0);`）或当值用
+    （`wheelSpeed #calc "$...";`）都能正确处理 —— 扫描时会跳过字符串里的括号，
+    遇到不属于自己的右括号就停；
+  * 同一条指令可重复出现（用 append 而不是 set 保存）。
+
+### 4.7 界面稳定性：不让内部错误把程序带走
 
 PyQt6 默认会把「Qt 槽函数里未捕获的 Python 异常」升级成致命错误并直接 `abort()`，
 表现出来就是"点一下某个控件，窗口整个消失"（闪退）。所以：
@@ -302,7 +330,7 @@ PyQt6 默认会把「Qt 槽函数里未捕获的 Python 异常」升级成致命
   避免把正在发信号的下拉框/还没提交的单元格编辑器连同弹窗一起销毁；
 * 主窗口的处理函数外面再包一层 `try/except`，任何意外都只影响这一次操作。
 
-### 4.6 3D 场景与 Qt 解耦
+### 4.8 3D 场景与 Qt 解耦
 
 `MeshScene` 是纯 VTK 的，不依赖 Qt；Qt 那边只是用一个 `QVTKRenderWindowInteractor` 承载它。
 因此可以在无图形界面的环境下用离屏渲染出图（`foamgui/tests/render_preview.py`），
@@ -346,9 +374,9 @@ docs/                         # 文档图片
 ## 6. 验证
 
 ```bash
-# 1) 单元测试：字典解析/网格读取/二进制网格/第三方导出格式/BC 推荐/案例读写
+# 1) 单元测试：字典解析(含量纲/指令行)/网格读取/二进制网格/第三方导出格式/BC 推荐/案例读写
 python -m foamgui.tests.test_foam airFoil2D
-#    -> 通过 61 项检查, 失败 0 项
+#    -> 通过 89 项检查, 失败 0 项
 
 # 2) 离屏 GUI 冒烟测试：打开 airFoil2D、切换每个页签、截图、试写字典
 QT_QPA_PLATFORM=offscreen FOAMGUI_SKIP_VTK_WIDGET=1 python -m foamgui.tests.smoke_gui airFoil2D _scratch/gui
@@ -366,6 +394,7 @@ python -m foamgui.tests.e2e_openfoam airFoil2D
 
 # 6) 只给"网格 + 0/", 让工具生成整套字典再真跑(层流 / kOmegaSST / SpalartAllmaras)
 python -m foamgui.tests.e2e_generate airFoil2D
+python -m foamgui.tests.e2e_generate cavity      # 没有网格: 会自动先 blockMesh
 #    -> 三种模式都: 自检未发现问题, foamRun 返回码 0
 
 # 7) 只有网格的案例(例如 ANSA 导出的 111): 同样能验证, 只是跳过求解器

@@ -211,10 +211,12 @@ def main(argv: list[str]) -> int:
         if _df.get_dict(case.get("system", "fvSolution"), "SIMPLE") else []
     win.solver_tab._commit_all()
     app.processEvents()
-    sim = _df.get_dict(case.get("system", "fvSolution"), "SIMPLE")
-    assert sim is not None and "pRefCell" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefCell"
-    assert "pRefValue" in sim.keys(), "提交默认值后 SIMPLE 里应当有 pRefValue"
-    print(f"[3k] 『把当前显示的值写入字典』正常(SIMPLE 现在有 {sim.keys()})", flush=True)
+    fvs = case.get("system", "fvSolution")
+    algo = _df.get_dict(fvs, "SIMPLE") or _df.get_dict(fvs, "PIMPLE")
+    assert algo is not None, "fvSolution 里既没有 SIMPLE 也没有 PIMPLE"
+    assert "pRefCell" in algo.keys(), "提交默认值后算法段里应当有 pRefCell"
+    assert "pRefValue" in algo.keys(), "提交默认值后算法段里应当有 pRefValue"
+    print(f"[3k] 『把当前显示的值写入字典』正常(算法段现在有 {algo.keys()})", flush=True)
 
     # 自检 + 修改补片网格类型
     from foamgui.foam import validate as _val

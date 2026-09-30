@@ -131,6 +131,52 @@ def test_binary_mesh() -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_dict_syntax() -> None:
+    """OpenFOAM 13 里容易踩的字典写法, 必须原样往返(否则写回会写坏用户文件)。"""
+    section("字典语法兼容(量纲/指令行)")
+
+    def roundtrip(text: str) -> str:
+        return dictfile.format_body(dictfile.parse_dict(text)).strip()
+
+    # 1) "值在前、量纲在后"的量纲写法(OpenFOAM 10+ 的单位形式)
+    for text in (
+        "nu 1e-05 [m^2/s];",
+        "rho 1 [kg/m^3];",
+        "mu 1.8e-05 [kg/m/s];",
+        "nu [0 2 -1 0 0 0 0] 1e-05;",          # 量纲在前
+        "dimensions [0 2 -1 0 0 0 0];",        # 只有量纲(场文件里的 dimensions)
+    ):
+        out = roundtrip(text)
+        check(out == text, f"量纲写法没有原样保留: {text!r} -> {out!r}")
+
+    # 2) 预处理指令行(#include/#includeEtc) 不能把后面的条目吞掉
+    text = (
+        '#includeEtc "caseDicts/setConstraintTypes"\n\n'
+        "inlet\n{\n    type fixedValue;\n    value uniform (1 0 0);\n}"
+    )
+    body = dictfile.parse_dict(text)
+    check("inlet" in body.keys(), "指令行把后面的条目吞掉了")
+    d = body.get("inlet")
+    check(isinstance(d, dictfile.FoamDict) and d.get("type") == "fixedValue",
+          "指令行后面的条目解析错误")
+    check('#includeEtc "caseDicts/setConstraintTypes"' in dictfile.format_body(body),
+          "指令行没有被原样写出")
+
+    # 3) 指令当值 / 指令在列表里
+    check(roundtrip('wheelSpeed #calc "$Uinlet / $wheelRadius";')
+          == 'wheelSpeed #calc "$Uinlet / $wheelRadius";', "#calc 当值没有往返")
+    check(roundtrip("internalField uniform (#neg $UMean 0 0);")
+          == "internalField uniform (#neg $UMean 0 0);", "列表里的 #neg 没有往返")
+    check(roundtrip('x #calc "sqrt(a)";') == 'x #calc "sqrt(a)";',
+          "#calc 字符串里的括号干扰了指令行截断")
+
+    # 4) #ifeq/#else/#endif 分支要整段保留
+    text = "#ifeq $x 1\nfoo bar;\n#else\nfoo baz;\n#endif"
+    out = roundtrip(text)
+    for piece in ("#ifeq $x 1", "#else", "#endif"):
+        check(piece in out, f"{piece} 没有保留")
+
+
 def test_exporter_compat() -> None:
     """兼容第三方前处理工具导出的网格(ANSA 风格)。
 
@@ -319,6 +365,7 @@ def main() -> int:
         test_dictfile,
         test_polymesh,
         test_binary_mesh,
+        test_dict_syntax,
         test_exporter_compat,
         test_fields,
         test_case_roundtrip,

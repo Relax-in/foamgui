@@ -242,10 +242,25 @@ def _check_solvers(case) -> list[Issue]:
     solvers = dictfile.get_dict(fvs, "solvers")
     if solvers is None:
         return out
-    keys = set(solvers.keys())
+
+    # solvers 里的键可以是正则, 例如 "(U|k|epsilon)"、"(U|k|epsilon)Final";
+    # 直接比字符串会把这类案例全部误报成"缺少 solver 设置"。
+    import re
+
+    patterns: list[re.Pattern[str]] = []
+    for key in solvers.keys():
+        expr = key.strip().strip('"').strip("'")
+        try:
+            patterns.append(re.compile(f"^(?:{expr})$"))
+        except re.error:
+            patterns.append(re.compile(f"^{re.escape(expr)}$"))
+
+    def covered(name: str) -> bool:
+        return any(p.match(name) for p in patterns)
+
     missing = [
         n for n in case.fields
-        if n not in keys and n not in _NO_SOLVER_FIELDS and not n.startswith("nuTilda")
+        if not covered(n) and n not in _NO_SOLVER_FIELDS and not n.startswith("nuTilda")
     ]
     if missing:
         out.append(Issue(

@@ -469,15 +469,57 @@ class SolverTab(QtWidgets.QWidget):
         d = self._fvs
         cb = self.changed.emit
         sim = dictfile.get_dict(d, "SIMPLE")
+        pimple = dictfile.get_dict(d, "PIMPLE")
+        # 稳态用 SIMPLE, 瞬态用 PIMPLE; 两者都要能填"非正交修正步数"和压力参考
         if sim is not None:
             add_atom_row(f, sim, "nNonOrthogonalCorrectors", "SIMPLE 非正交修正步数", "text", None, "0", "", cb)
             add_atom_row(f, sim, "consistent", "SIMPLE consistent", "choice", ["yes", "no"], "yes", "", cb)
             add_atom_row(f, sim, "pRefCell", "参考压力单元 pRefCell", "text", None, "0", "", cb)
             add_atom_row(f, sim, "pRefValue", "参考压力值 pRefValue", "text", None, "0", "", cb)
-        pimple = dictfile.get_dict(d, "PIMPLE")
         if pimple is not None:
             add_atom_row(f, pimple, "nOuterCorrectors", "PIMPLE 外迭代次数", "text", None, "1", "", cb)
             add_atom_row(f, pimple, "nCorrectors", "PIMPLE 内迭代次数", "text", None, "2", "", cb)
+            add_atom_row(f, pimple, "nNonOrthogonalCorrectors", "PIMPLE 非正交修正步数", "text", None, "0", "", cb)
+            add_atom_row(f, pimple, "momentumPredictor", "动量预测 momentumPredictor",
+                         "choice", ["yes", "no"], "yes", "瞬态常关掉(no)以省时间", cb)
+            add_atom_row(f, pimple, "pRefCell", "参考压力单元 pRefCell", "text", None, "0", "", cb)
+            add_atom_row(f, pimple, "pRefValue", "参考压力值 pRefValue", "text", None, "0", "", cb)
+        if sim is None and pimple is None:
+            # 文件里既没有 SIMPLE 也没有 PIMPLE: 不悄悄加, 给个显式按钮
+            steady = self._is_steady()
+            algo = "SIMPLE" if steady else "PIMPLE"
+            btn = QtWidgets.QPushButton(f"补上 {algo} 算法段({'稳态' if steady else '瞬态'})")
+            btn.setToolTip(
+                "fvSolution 里没有 SIMPLE/PIMPLE 段, 求解器无法运行。\n"
+                f"按当前时间格式({'steadyState' if steady else '非稳态'})补一个 {algo} 段"
+            )
+
+            def _add_algo() -> None:
+                sub = FoamDict()
+                if algo == "SIMPLE":
+                    sub.set("nNonOrthogonalCorrectors", "0")
+                    sub.set("consistent", "yes")
+                else:
+                    sub.set("nOuterCorrectors", "2")
+                    sub.set("nCorrectors", "2")
+                    sub.set("nNonOrthogonalCorrectors", "0")
+                sub.set("pRefCell", "0")
+                sub.set("pRefValue", "0")
+                d.set(algo, sub)
+                self._fill_solution_extras()
+                self.changed.emit()
+                self.statusMessage.emit(f"已补上 {algo} 算法段(可继续调整)")
+
+            btn.clicked.connect(_add_algo)
+            f.addRow(btn)
+
+    def _is_steady(self) -> bool:
+        """按 fvSchemes 的 ddtSchemes/default 判断是不是稳态。"""
+        if self.case is None:
+            return True
+        fvs = self.case.get("system", "fvSchemes")
+        ddt = dictfile.get_dict(fvs, "ddtSchemes") if fvs is not None else None
+        return (dictfile.get_atom(ddt, "default", "steadyState") or "").strip().lower() == "steadystate"
         relax = dictfile.get_dict(d, "relaxationFactors")
         if relax is not None:
             fields = dictfile.get_dict(relax, "fields")

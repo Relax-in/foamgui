@@ -41,11 +41,18 @@ MODES = {
 
 
 def prepare(src: Path, dst: Path) -> None:
-    """复制案例, 然后删掉所有"应该由工具生成"的字典(保留网格与 0/)。"""
+    """复制案例, 删掉所有"应该由工具生成"的字典, 没有网格时先 blockMesh。
+
+    注意 ``system/blockMeshDict`` 要留着(它不是工具生成的字典, 而是用来建网格的);
+    教程里的 cavity 这类案例只有 blockMeshDict, 没有 constant/polyMesh。
+    """
     shutil.rmtree(dst, ignore_errors=True)
     shutil.copytree(src, dst)
     shutil.rmtree(dst / "foamgui_backup", ignore_errors=True)
-    shutil.rmtree(dst / "system", ignore_errors=True)
+    # controlDict 保留: 它定义案例的物理与时间格式(工具据此决定稳态/瞬态),
+    # 只删掉应该由工具生成的字典
+    for name in ("fvSchemes", "fvSolution"):
+        (dst / "system" / name).unlink(missing_ok=True)
     for name in ("momentumTransport", "physicalProperties"):
         (dst / "constant" / name).unlink(missing_ok=True)
     for entry in list(dst.iterdir()):          # 结果时间目录(0/ 留着)
@@ -55,6 +62,18 @@ def prepare(src: Path, dst: Path) -> None:
     for entry in list((dst / "0").iterdir()):
         if entry.name not in ("U", "p"):
             entry.unlink(missing_ok=True)
+    # 没有网格文件的案例(例如 cavity): 先用 blockMesh 建网格
+    if not (dst / "constant" / "polyMesh" / "points").exists():
+        case = FoamCase(dst)
+        case.load()
+        if not case.needs_block_mesh():
+            print(f"[!] {dst} 既没有网格也没有 blockMeshDict")
+            return
+        ok, out = case.run_block_mesh()
+        print(f"[{dst.name}] blockMesh {'完成' if ok else '失败'}: "
+              f"{case.mesh.n_cells if case.mesh else 0} 个单元", flush=True)
+        if not ok:
+            print("\n".join(out.splitlines()[-8:]), flush=True)
 
 
 def configure(case: FoamCase, sim: str, model: str) -> list[str]:

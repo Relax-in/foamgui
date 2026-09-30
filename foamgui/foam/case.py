@@ -15,7 +15,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from . import dictfile, fields as fields_mod, polymesh, validate
+from . import dictfile, fields as fields_mod, ofenv, polymesh, validate
 from .fields import apply_params
 from .dictfile import FoamDict
 
@@ -169,6 +169,8 @@ class FoamCase:
         self.system: dict[str, tuple[FoamDict, str]] = {}  # name -> (dict, class)
         self.constant: dict[str, tuple[FoamDict, str]] = {}
         self.warnings: list[str] = []
+        #: 工具自己生成的字典(相对路径); 这些文件里补默认条目是合理的
+        self.generated_files: set[str] = set()
         self._loaded = False
         # 网格(boundary)是否被改过(例如补片重命名), 改过才需要写出 boundary 文件
         self.mesh_modified = False
@@ -367,26 +369,52 @@ class FoamCase:
         """缺少 system/constant 文件时给出 OpenFOAM 13 的合理默认值。"""
         if "controlDict" not in self.system:
             self.system["controlDict"] = (_default_control_dict(), "dictionary")
+            self.generated_files.add("system/controlDict")
             self.warnings.append("未找到 system/controlDict, 已使用默认值")
+        transient = self.looks_transient()
         if "fvSchemes" not in self.system:
-            self.system["fvSchemes"] = (_default_fv_schemes(self.fields), "dictionary")
+            self.system["fvSchemes"] = (
+                _default_fv_schemes(self.fields, transient), "dictionary"
+            )
+            self.generated_files.add("system/fvSchemes")
             self.warnings.append("未找到 system/fvSchemes, 已使用默认值")
         if "fvSolution" not in self.system:
+            # 注意: 这时可能还没读网格, 判断不了压力是否需要参考点;
+            # load_mesh() 之后会再检查一遍(_ensure_pressure_reference)
             self.system["fvSolution"] = (
-                _default_fv_solution(self.field_categories(), self.pressure_needs_reference()),
+                _default_fv_solution(self.field_categories(), False, transient),
                 "dictionary",
             )
+            self.generated_files.add("system/fvSolution")
             self.warnings.append("未找到 system/fvSolution, 已使用默认值")
         if "momentumTransport" not in self.constant:
             self.constant["momentumTransport"] = (
                 _default_momentum_transport(self.fields),
                 "dictionary",
             )
+            self.generated_files.add("constant/momentumTransport")
             sim = dictfile.get_atom(self.constant["momentumTransport"][0], "simulationType", "")
             if sim:
                 self.warnings.append(f"未找到 constant/momentumTransport, 已按案例里的场选择 {sim}")
         if "physicalProperties" not in self.constant:
             self.constant["physicalProperties"] = (_default_physical_properties(), "dictionary")
+            self.generated_files.add("constant/physicalProperties")
+
+    def looks_transient(self) -> bool:
+        """按 controlDict 判断案例是不是瞬态。
+
+        OpenFOAM 的惯例: 稳态案例把 ``deltaT`` 当"迭代计数", 一般就是 1;
+        瞬态案例的 ``deltaT`` 会明显小于 1(例如 cavity 的 0.005)。
+        生成 fvSchemes/fvSolution 时要和它保持一致。
+        """
+        cd = self.control_dict()
+        if cd is None:
+            return False
+        try:
+            dt = float(dictfile.get_atom(cd, "deltaT", "1") or 1)
+        except (TypeError, ValueError):
+            return False
+        return 0 < dt < 1
 
     def pressure_needs_reference(self) -> bool:
         """压力边界全是零梯度/对称 -> 需要 pRefCell/pRefValue。"""
@@ -445,6 +473,11 @@ class FoamCase:
                     entry.set("relTol", "0.1")
                 solvers.set(n, entry)
                 added.append(f"fvSolution: solvers/{n}")
+            if dictfile.get_dict(solution, "PIMPLE") is not None:
+                before = set(solvers.keys())
+                _add_final_solvers(solvers)
+                for key in sorted(set(solvers.keys()) - before):
+                    added.append(f"fvSolution: solvers/{key}")
         return added
 
     def field_categories(self) -> dict[str, tuple[str, str]]:
@@ -452,11 +485,76 @@ class FoamCase:
         return {n: (f.category, f.kind) for n, f in self.fields.items()}
 
     # -- 网格 ---------------------------------------------------------------
+    # -- 网格生成 -----------------------------------------------------------
+    @property
+    def block_mesh_dict(self) -> Path | None:
+        """``system/blockMeshDict`` 的路径(没有则 None)。"""
+        for name in ("blockMeshDict", "blockMeshDict.gz"):
+            path = self.root / "system" / name
+            if path.exists():
+                return path
+        return None
+
+    def needs_block_mesh(self) -> bool:
+        """案例是不是"还没生成网格"(有 blockMeshDict 但没有 constant/polyMesh)。"""
+        try:
+            polymesh.find_polymesh_dir(self.root)
+            return False
+        except polymesh.MeshError:
+            return self.block_mesh_dict is not None
+
+    def run_block_mesh(self, timeout: float = 600.0) -> tuple[bool, str]:
+        """运行 ``blockMesh`` 生成网格, 成功后重新读入。
+
+        返回 ``(成功?, 输出文本)``。找不到 OpenFOAM 或 blockMeshDict 时返回 False。
+        """
+        if self.block_mesh_dict is None:
+            return False, "案例里没有 system/blockMeshDict, 无法用 blockMesh 生成网格"
+        rc, out = ofenv.run_foam_tool(
+            ["blockMesh", "-case", str(self.root)], timeout=timeout
+        )
+        ok = rc == 0 and "End" in out
+        if ok:
+            self.mesh = None
+            self.mesh_dir = None
+            self.load_mesh()          # 重新定位并读入
+        return ok, out
+
     def load_mesh(self) -> polymesh.PolyMesh:
         if self.mesh is None:
-            self.mesh_dir = polymesh.find_polymesh_dir(self.root)
+            try:
+                self.mesh_dir = polymesh.find_polymesh_dir(self.root)
+            except polymesh.MeshError as exc:
+                if self.block_mesh_dict is not None:
+                    raise polymesh.MeshError(
+                        f"{exc}; 这个案例有 system/blockMeshDict, 可以先生成网格"
+                        "(界面上: 文件 -> 生成网格(blockMesh), 或在打开案例时选择生成)"
+                    ) from None
+                raise
             self.mesh = polymesh.read_polymesh(self.mesh_dir)
+            self._ensure_pressure_reference()
         return self.mesh
+
+    def _ensure_pressure_reference(self) -> None:
+        """读了网格才知道压力有没有参考点: 给**工具自己生成的** fvSolution 补上。
+
+        封闭域(四周全是壁面/对称面)的压力方程是纯 Neumann 的, 没有 pRefCell
+        求解器会直接报 "Unable to set reference cell for field p"。
+        用户自己的 fvSolution 不动(自检会提示, 界面上可以一键补)。
+        """
+        if "system/fvSolution" not in self.generated_files:
+            return
+        if not self.pressure_needs_reference():
+            return
+        fvs = self.get("system", "fvSolution")
+        if fvs is None:
+            return
+        for algo in ("SIMPLE", "PIMPLE"):
+            sub = dictfile.get_dict(fvs, algo)
+            if sub is not None and "pRefCell" not in sub and "pRefPoint" not in sub:
+                sub.set("pRefCell", "0")
+                sub.set("pRefValue", "0")
+                self.warnings.append(f"压力边界没有参考点, 已在 {algo} 里补上 pRefCell/pRefValue")
 
     @property
     def patch_names(self) -> list[str]:
@@ -626,22 +724,31 @@ _TURB_DIV_SCHEMES = {
 }
 
 
-def _default_fv_schemes(field_names: Iterable[str] | None = None) -> FoamDict:
+def _default_fv_schemes(
+    field_names: Iterable[str] | None = None, transient: bool = False
+) -> FoamDict:
     """默认 fvSchemes。
 
-    ``divSchemes`` 里要**按案例实际存在的场**给出对流格式: 少写一个
-    ``div(phi,k)`` 求解器就会报 "keyword div(phi,k) is undefined"。
+    * ``divSchemes`` 里要**按案例实际存在的场**给出对流格式: 少写一个
+      ``div(phi,k)`` 求解器就会报 "keyword div(phi,k) is undefined";
+    * ``transient`` 为真时用瞬态的一套(``Euler`` + 教程里瞬态常用的
+      ``Gauss limitedLinearV 1``), 否则用稳态的一套(``steadyState`` +
+      ``bounded Gauss linearUpwind``)。生成的和 controlDict 的时间格式不一致,
+      求解器很容易直接发散。
     """
     names = set(field_names or ())
     d = FoamDict()
-    d.set("ddtSchemes", FoamDict([("default", "steadyState")]))
+    d.set("ddtSchemes", FoamDict([("default", "Euler" if transient else "steadyState")]))
     grad = FoamDict()
     grad.set("default", "Gauss linear")
-    grad.set("grad(U)", "cellLimited Gauss linear 1")   # 稳态下更稳(教程同款)
+    grad.set("grad(U)", "cellLimited Gauss linear 1")
     d.set("gradSchemes", grad)
     div = FoamDict()
     div.set("default", "none")
-    div.set("div(phi,U)", "bounded Gauss linearUpwind grad(U)")
+    div.set(
+        "div(phi,U)",
+        "Gauss limitedLinearV 1" if transient else "bounded Gauss linearUpwind grad(U)",
+    )
     div.set("div((nuEff*dev2(T(grad(U)))))", "Gauss linear")
     for name, scheme in _TURB_DIV_SCHEMES.items():
         if name in names:
@@ -654,6 +761,25 @@ def _default_fv_schemes(field_names: Iterable[str] | None = None) -> FoamDict:
     return d
 
 
+#: 不需要线性求解器的场(由模型算出), 也就不需要 <场>Final 条目
+_NO_SOLVER_FIELDS = {"nut", "alphat", "mut", "muEff"}
+
+
+def _add_final_solvers(solvers: FoamDict) -> None:
+    """PIMPLE 的"末次修正"会去找 ``<场>Final``, 缺了会报
+    ``keyword UFinal is undefined``。这里按基础条目复制一份并把 relTol 调成 0
+    (教程里也是这么写的: ``pFinal { $p; relTol 0; }``)。
+    """
+    for name, sub in list(solvers.items):
+        if not isinstance(sub, FoamDict) or name.endswith("Final"):
+            continue
+        if name in _NO_SOLVER_FIELDS:
+            continue
+        fin = FoamDict(list(sub.items))
+        fin.set("relTol", "0")
+        solvers.set(f"{name}Final", fin)
+
+
 #: 湍流标量场的线性求解器: 这些方程是**非对称**的, 实测用
 #  smoothSolver/symGaussSeidel 在多面体网格上容易把 omega 算发散
 #  (残差 1e185, 然后 k 溢出触发 SIGFPE), 换成 PBiCGStab + DILU 就稳了。
@@ -662,7 +788,9 @@ _TURB_SOLVER = {"solver": "PBiCGStab", "preconditioner": "DILU",
 
 
 def _default_fv_solution(
-    categories: dict[str, tuple[str, str]], needs_p_ref: bool = False
+    categories: dict[str, tuple[str, str]],
+    needs_p_ref: bool = False,
+    transient: bool = False,
 ) -> FoamDict:
     d = FoamDict()
     solvers = FoamDict()
@@ -684,6 +812,19 @@ def _default_fv_solution(
             s.set("relTol", "0.1")
         solvers.set(name, s)
     d.set("solvers", solvers)
+    if transient:
+        # 瞬态用 PIMPLE(Euler + PIMPLE 是教程里最常见的瞬态组合)
+        pimple = FoamDict()
+        pimple.set("nOuterCorrectors", "1")
+        pimple.set("nCorrectors", "2")
+        pimple.set("nNonOrthogonalCorrectors", "0")
+        if needs_p_ref:
+            pimple.set("pRefCell", "0")
+            pimple.set("pRefValue", "0")
+        _add_final_solvers(solvers)
+        d.set("PIMPLE", pimple)
+        return d
+
     simple = FoamDict()
     simple.set("nNonOrthogonalCorrectors", "0")
     simple.set("consistent", "yes")
